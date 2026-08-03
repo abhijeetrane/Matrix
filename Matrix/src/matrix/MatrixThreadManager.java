@@ -1,4 +1,10 @@
 package matrix;
+
+/*
+ * Matrix is simulation of Multiverse. 
+ * Author: Abhijeet Rane
+ * Initial Version:03-August-2026
+ */
 public class MatrixThreadManager {
 
     // Shared object used for signaling and synchronization
