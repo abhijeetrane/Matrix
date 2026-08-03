@@ -39,120 +39,139 @@ public class Matrix extends JPanel{
         timer.start();
     }
 
-    @Override
-    protected void paintComponent(Graphics g) {
-        super.paintComponent(g);
-       
-        
-        //East Matrix 
-        Graphics2D g2dEast = (Graphics2D) g;
-               
-        // Enable Antialiasing for smooth vector rendering
-        g2dEast.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+    
+    protected void drawEastMatrix() {
+    
+    	
+    } 	
+    	@Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+           
+            
+            //East Matrix 
+            Graphics2D g2dEast = (Graphics2D) g;
+                   
+            // Enable Antialiasing for smooth vector rendering
+            g2dEast.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
-        int centerXEast = getWidth() / 2;
-        int centerYEast = getHeight() / 2;
-                
+            int centerXEast = getWidth() / 2;
+            int centerYEast = getHeight() / 2;
+                    
 
-        // --- Draw Shadow ---
-        g2dEast.setColor(new Color(200, 200, 200, 120));
-        g2dEast.fillOval(centerXEast - 40, centerYEast + 85, 80, 15);
+            // --- Draw Shadow ---
+            g2dEast.setColor(new Color(200, 200, 200, 120));
+            g2dEast.fillOval(centerXEast - 40, centerYEast + 85, 80, 15);
 
-        // --- Draw the Top Body ---
-        
-        // 1. Handle / Peg (Top Knob)
-        g2dEast.setColor(new Color(139, 69, 19)); // Saddle Brown
-        g2dEast.fillRect(centerXEast - 4, centerYEast - 80, 8, 30);
-        g2dEast.fillOval(centerXEast - 8, centerYEast - 85, 16, 10);
+            // --- Draw the Top Body ---
+            
+            // 1. Handle / Peg (Top Knob)
+            g2dEast.setColor(new Color(139, 69, 19)); // Saddle Brown
+            g2dEast.fillRect(centerXEast - 4, centerYEast - 80, 8, 30);
+            g2dEast.fillOval(centerXEast - 8, centerYEast - 85, 16, 10);
 
-        // 2. Cone Base (Top Section)
-        Path2D topConeEast = new Path2D.Double();
-        topConeEast.moveTo(centerXEast, centerYEast - 50);
-        topConeEast.lineTo(centerXEast + 70, centerYEast);
-        topConeEast.lineTo(centerXEast - 70, centerYEast);
-        topConeEast.closePath();
-        
-        g2dEast.setColor(new Color(220, 50, 50)); // Red upper body
-        //g2d.setColor(new Color(0, 128, 0)); // Green upper body
-        
-        
-        g2dEast.fill(topConeEast);
+            // 2. Cone Base (Top Section)
+            Path2D topConeEast = new Path2D.Double();
+            topConeEast.moveTo(centerXEast, centerYEast - 50);
+            topConeEast.lineTo(centerXEast + 70, centerYEast);
+            topConeEast.lineTo(centerXEast - 70, centerYEast);
+            topConeEast.closePath();
+            
+            g2dEast.setColor(new Color(220, 50, 50)); // Red upper body
+            //g2d.setColor(new Color(0, 128, 0)); // Green upper body
+            
+            
+            g2dEast.fill(topConeEast);
 
-        // 3. Bottom Tip (Lower Cone)
-        Path2D bottomTipEast = new Path2D.Double();
-        bottomTipEast.moveTo(centerXEast - 70, centerYEast);
-        bottomTipEast.lineTo(centerXEast + 70, centerYEast);
-        bottomTipEast.lineTo(centerXEast, centerYEast + 90);
-        bottomTipEast.closePath();
-        
-        g2dEast.setColor(new Color(220, 50, 50)); // Red lower body
-        //g2d.setColor(new Color(0, 128, 0)); // Green lower body
-        
-        g2dEast.fill(bottomTipEast);
+            // 3. Bottom Tip (Lower Cone)
+            Path2D bottomTipEast = new Path2D.Double();
+            bottomTipEast.moveTo(centerXEast - 70, centerYEast);
+            bottomTipEast.lineTo(centerXEast + 70, centerYEast);
+            bottomTipEast.lineTo(centerXEast, centerYEast + 90);
+            bottomTipEast.closePath();
+            
+            g2dEast.setColor(new Color(220, 50, 50)); // Red lower body
+            //g2d.setColor(new Color(0, 128, 0)); // Green lower body
+            
+            g2dEast.fill(bottomTipEast);
 
-        // 4. Metal Spinning Tip Point
-        g2dEast.setColor(Color.GRAY);
-        g2dEast.fillOval(centerXEast - 3, centerYEast + 87, 6, 6);
+            // 4. Metal Spinning Tip Point
+            g2dEast.setColor(Color.GRAY);
+            g2dEast.fillOval(centerXEast - 3, centerYEast + 87, 6, 6);
 
-        // --- Spinning Bands / Pattern ---
-        // Simulates rotational movement using squashed elliptical bands
-        drawSpinningBands(g2dEast, centerXEast, centerYEast);
+            // --- Spinning Bands / Pattern ---
+            // Simulates rotational movement using squashed elliptical bands
+            drawSpinningBands(g2dEast, centerXEast, centerYEast);
 
-     // Enable Antialiasing for smooth vector rendering
-        g2dEast.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);       
-        
-        
-        //West Matrix 
-        Graphics2D g2dWest = (Graphics2D) g;
-        
-        int centerXWest = getWidth() / 4;
-        int centerYWest = getHeight() / 4;
-        
+         // Enable Antialiasing for smooth vector rendering
+            g2dEast.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);       
+            
+            
+            //West Matrix 
+            Graphics2D g2dWest = (Graphics2D) g;
+            
+            int centerXWest = getWidth() / 4;
+            int centerYWest = getHeight() / 4;
+            
 
-        // --- Draw Shadow ---
-        g2dWest.setColor(new Color(200, 200, 200, 120));
-        g2dWest.fillOval(centerXWest - 40, centerYWest + 85, 80, 15);
+            // --- Draw Shadow ---
+            g2dWest.setColor(new Color(200, 200, 200, 120));
+            g2dWest.fillOval(centerXWest - 40, centerYWest + 85, 80, 15);
 
-        // --- Draw the Top Body ---
-        
-        // 1. Handle / Peg (Top Knob)
-        g2dWest.setColor(new Color(139, 69, 19)); // Saddle Brown
-        g2dWest.fillRect(centerXWest - 4, centerYWest - 80, 8, 30);
-        g2dWest.fillOval(centerXWest - 8, centerYWest - 85, 16, 10);
+            // --- Draw the Top Body ---
+            
+            // 1. Handle / Peg (Top Knob)
+            g2dWest.setColor(new Color(139, 69, 19)); // Saddle Brown
+            g2dWest.fillRect(centerXWest - 4, centerYWest - 80, 8, 30);
+            g2dWest.fillOval(centerXWest - 8, centerYWest - 85, 16, 10);
 
-        // 2. Cone Base (Top Section)
-        Path2D topConeWest = new Path2D.Double();
-        topConeWest.moveTo(centerXWest, centerYWest - 50);
-        topConeWest.lineTo(centerXWest + 70, centerYWest);
-        topConeWest.lineTo(centerXWest - 70, centerYWest);
-        topConeWest.closePath();
-        
-        g2dWest.setColor(new Color(220, 50, 50)); // Red upper body
-        //g2d.setColor(new Color(0, 128, 0)); // Green upper body
-        
-        
-        g2dWest.fill(topConeWest);
+            // 2. Cone Base (Top Section)
+            Path2D topConeWest = new Path2D.Double();
+            topConeWest.moveTo(centerXWest, centerYWest - 50);
+            topConeWest.lineTo(centerXWest + 70, centerYWest);
+            topConeWest.lineTo(centerXWest - 70, centerYWest);
+            topConeWest.closePath();
+            
+            g2dWest.setColor(new Color(220, 50, 50)); // Red upper body
+            //g2d.setColor(new Color(0, 128, 0)); // Green upper body
+            
+            
+            g2dWest.fill(topConeWest);
 
-        // 3. Bottom Tip (Lower Cone)
-        Path2D bottomTipWest = new Path2D.Double();
-        bottomTipWest.moveTo(centerXWest - 70, centerYWest);
-        bottomTipWest.lineTo(centerXWest + 70, centerYWest);
-        bottomTipWest.lineTo(centerXWest, centerYWest + 90);
-        bottomTipWest.closePath();
-        
-        g2dWest.setColor(new Color(220, 50, 50)); // Red lower body
-        //g2d.setColor(new Color(0, 128, 0)); // Green lower body
-        
-        g2dWest.fill(bottomTipWest);
+            // 3. Bottom Tip (Lower Cone)
+            Path2D bottomTipWest = new Path2D.Double();
+            bottomTipWest.moveTo(centerXWest - 70, centerYWest);
+            bottomTipWest.lineTo(centerXWest + 70, centerYWest);
+            bottomTipWest.lineTo(centerXWest, centerYWest + 90);
+            bottomTipWest.closePath();
+            
+            g2dWest.setColor(new Color(220, 50, 50)); // Red lower body
+            //g2d.setColor(new Color(0, 128, 0)); // Green lower body
+            
+            g2dWest.fill(bottomTipWest);
 
-        // 4. Metal Spinning Tip Point
-        g2dWest.setColor(Color.GRAY);
-        g2dWest.fillOval(centerXWest - 3, centerYWest + 87, 6, 6);
+            // 4. Metal Spinning Tip Point
+            g2dWest.setColor(Color.GRAY);
+            g2dWest.fillOval(centerXWest - 3, centerYWest + 87, 6, 6);
 
-        
-        drawSpinningBands(g2dWest, centerXWest, centerYWest);
+            
+            drawSpinningBands(g2dWest, centerXWest, centerYWest);
+            
+            
+         // Enable Antialiasing for smooth vector rendering
+            g2dWest.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);       
+         
+          
+
+        }
+
+    
+    
+    protected void drawWestMatrix() {
+    	
     }
-
+    
+    
     private void drawSpinningBands(Graphics2D g2d, int cx, int cy) {
         // Draw stripes that deform along an elliptical path to mimic 3D motion
         int bandWidth = 140;
@@ -203,7 +222,24 @@ public class Matrix extends JPanel{
         
         MatrixThreadManager matrixThreadManager = new MatrixThreadManager();
         matrixThreadManager.alternateBetweenEastAndWestMatrix();
+
+        /*int count = 0;
         
+        while(count < 1000 ) {
+            
+        	
+           
+       	
+           try {
+           Thread.sleep(5000);
+           }catch(Exception ex) {
+           	
+           }
+           	
+        
+           
+       }*/
+
         
         frame.setVisible(true);	
 		
