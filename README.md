@@ -17,6 +17,9 @@ abhijeet.rane@gmail.com
 Mobile no:
 +91-9967840909
 -----------------------------------------------------------------------------------------------------------------------------------------
+Linkedin:
+https://www.linkedin.com/in/er-abhijeet-r-931a5b168/
+-----------------------------------------------------------------------------------------------------------------------------------------
 License:-
-Matrix is released under the [Apache 2.0 License](https://www.apache.org/licenses/LICENSE-2.0.html), offering unrestricted usage in both commercial and non-commercial projects.
+Matrix is open source code released under the [Apache 2.0 License](https://www.apache.org/licenses/LICENSE-2.0.html), offering unrestricted usage in both commercial and non-commercial projects.
 -----------------------------------------------------------------------------------------------------------------------------------------
