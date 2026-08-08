@@ -18,7 +18,7 @@ import javax.swing.Timer;
  * Matrix is simulation of Multiverse. 
  * Author: Abhijeet Rane
  * 03-August-2026 : Initial Version
- *       -August-2026 : Update after rebirth and Matrix reboot or reload
+ * 08-August-2026 : Update after rebirth and Matrix reboot or reload
  */
 public class Matrix extends JPanel{
 	
