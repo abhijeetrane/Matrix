@@ -1,0 +1,81 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * Alternate p2m HVM
+ * Copyright (c) 2014, Intel Corporation.
+ */
+
+#ifndef __ASM_X86_ALTP2M_H
+#define __ASM_X86_ALTP2M_H
+
+#ifdef CONFIG_ALTP2M
+
+#include <xen/types.h>
+#include <xen/sched.h>         /* for struct vcpu, struct domain */
+#include <asm/hvm/vcpu.h>      /* for vcpu_altp2m */
+
+static inline bool altp2m_is_eptp_valid(const struct domain *d,
+                                        unsigned int idx)
+{
+    /* There must be enough EPTP entries to cover all altp2m indices */
+    BUILD_BUG_ON(MAX_EPTP < MAX_NR_ALTP2M);
+
+    /* Domain should not have more altp2m entries than MAX_NR_ALTP2M */
+    ASSERT(d->nr_altp2m <= MAX_NR_ALTP2M);
+
+    /* EPTP index is used as altp2m index */
+    return idx < d->nr_altp2m &&
+        d->arch.altp2m_eptp[array_index_nospec(idx, MAX_EPTP)] !=
+        mfn_x(INVALID_MFN);
+}
+
+/* Alternate p2m HVM on/off per domain */
+static inline bool altp2m_active(const struct domain *d)
+{
+    return d->arch.altp2m_active;
+}
+
+static inline uint16_t altp2m_vcpu_idx(const struct vcpu *v)
+{
+    return vcpu_altp2m(v).p2midx;
+}
+
+/* Alternate p2m VCPU */
+void altp2m_vcpu_initialise(struct vcpu *v);
+void altp2m_vcpu_destroy(struct vcpu *v);
+
+int altp2m_vcpu_enable_ve(struct vcpu *v, gfn_t gfn);
+void altp2m_vcpu_disable_ve(struct vcpu *v);
+
+int p2m_set_suppress_ve(struct domain *d, gfn_t gfn, bool suppress_ve,
+                        unsigned int altp2m_idx);
+
+struct xen_hvm_altp2m_suppress_ve_multi;
+int p2m_set_suppress_ve_multi(struct domain *d,
+                              struct xen_hvm_altp2m_suppress_ve_multi *sve);
+
+int p2m_get_suppress_ve(struct domain *d, gfn_t gfn, bool *suppress_ve,
+                        unsigned int altp2m_idx);
+
+#else
+
+static inline bool altp2m_is_eptp_valid(const struct domain *d,
+                                        unsigned int idx)
+{
+    return false;
+}
+
+static inline bool altp2m_active(const struct domain *d)
+{
+    return false;
+}
+
+/* Only declaration is needed. DCE will optimise it out when linking. */
+uint16_t altp2m_vcpu_idx(const struct vcpu *v);
+void altp2m_vcpu_initialise(struct vcpu *v);
+void altp2m_vcpu_destroy(struct vcpu *v);
+int altp2m_vcpu_enable_ve(struct vcpu *v, gfn_t gfn);
+void altp2m_vcpu_disable_ve(struct vcpu *v);
+
+#endif
+
+#endif /* __ASM_X86_ALTP2M_H */

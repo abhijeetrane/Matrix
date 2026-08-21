@@ -1,0 +1,357 @@
+= Lucene Index
+
+The Lucene index adds full-text search capabilities to entities stored in a GigaMap. Like the xref:indexing/bitmap/index.adoc[Bitmap] and xref:indexing/jvector/index.adoc[JVector] indices, it is registered with the GigaMap and automatically kept in sync as entities are added, updated, or removed. When it is registered on a GigaMap that already contains entities, those existing entities are indexed immediately (back-filled), so the index can be added at any time — whether before or after the data is loaded.
+
+Under the hood, the index uses https://lucene.apache.org[Apache Lucene], the de facto industry standard for full-text indexing in the Java ecosystem. This enables powerful text search features including tokenization, stemming, relevance scoring, and the full Lucene query syntax.
+
+== What is Full-Text Search?
+
+Traditional database queries match exact values: `firstName = "John"` finds only exact matches. Full-text search is different - it understands text:
+
+* *Tokenization*: "Machine Learning Tutorial" becomes searchable as "machine", "learning", "tutorial"
+* *Case insensitivity*: "PYTHON" matches "python" and "Python"
+* *Relevance scoring*: Results are ranked by how well they match
+* *Partial matching*: Wildcards like `Py*` find "Python", "Pygame", etc.
+
+=== When to Use Full-Text Search
+
+[options="header",cols="1,1,2"]
+|===
+|Query Type |Index Type |Example
+
+|Exact match
+|Bitmap
+|`category = "Electronics"`
+
+|Full-text search
+|Lucene
+|`description contains "wireless bluetooth"`
+
+|Similarity search
+|JVector
+|"Find products similar to this one"
+|===
+
+Use the Lucene index when you need to:
+
+* Search within text content (descriptions, articles, comments)
+* Find documents by keywords regardless of exact phrasing
+* Rank results by relevance
+* Support advanced search syntax (AND, OR, phrases, wildcards)
+* Build search-as-you-type features
+
+== Installation
+
+[source, xml, subs=attributes+, title="Maven [pom.xml]"]
+----
+<dependency>
+    <groupId>org.eclipse.store</groupId>
+    <artifactId>gigamap-lucene</artifactId>
+    <version>{maven-version}</version>
+</dependency>
+<dependency>
+    <groupId>org.apache.lucene</groupId>
+    <artifactId>lucene-core</artifactId>
+    <version>${lucene.version}</version>
+</dependency>
+<dependency>
+    <groupId>org.apache.lucene</groupId>
+    <artifactId>lucene-queryparser</artifactId>
+    <version>${lucene.version}</version>
+</dependency>
+----
+
+== Example
+
+First, implement a `DocumentPopulator` that maps your entity fields to Lucene document fields.
+
+[source, java]
+----
+public class ArticleDocumentPopulator extends DocumentPopulator<Article>
+{
+    @Override
+    public void populate(Document document, Article article)
+    {
+        document.add(createTextField("title", article.getTitle()));
+        document.add(createTextField("content", article.getContent()));
+        document.add(createStringField("author", article.getAuthor()));
+    }
+}
+----
+
+Then create a `LuceneContext` and register it with the GigaMap.
+
+[source, java]
+----
+// Create context with document populator
+LuceneContext<Article> context = LuceneContext.New(
+    Paths.get("lucene-index"),      // Directory for index files
+    new ArticleDocumentPopulator()  // Maps entities to documents
+);
+
+// Create GigaMap and register Lucene index
+GigaMap<Article> articles = GigaMap.New();
+LuceneIndex<Article> luceneIndex = articles.index().register(LuceneIndex.Category(context));
+
+// Add entities (automatically indexed)
+articles.add(new Article("Python Guide", "Learn Python programming...", "Jane"));
+articles.add(new Article("Java Tips", "Best practices for Java...", "John"));
+----
+
+NOTE: Registration order does not matter. If the GigaMap already holds entities when the index is registered, they are back-filled into the new index, so a subsequent `query` finds them just like entities added afterwards. On a very large GigaMap this back-fill iterates all entities once, which can take a while; registering the index before bulk-loading avoids that initial scan.
+
+Query using the Lucene query syntax.
+
+[source, java]
+----
+// Simple field search
+List<Article> pythonArticles = luceneIndex.query("title:Python");
+
+// Full-text search across content
+List<Article> programmingArticles = luceneIndex.query("content:programming");
+
+// Boolean queries
+List<Article> javaByJohn = luceneIndex.query("title:Java AND author:John");
+
+// Wildcard search
+List<Article> pyArticles = luceneIndex.query("title:Py*");
+
+// Phrase search
+List<Article> exactPhrase = luceneIndex.query("content:\"best practices\"");
+----
+
+== Field Types
+
+The `DocumentPopulator` provides helper methods for different field types:
+
+[options="header",cols="1,2,2"]
+|===
+|Method |Lucene Field Type |Use Case
+
+|`createTextField(name, value)`
+|TextField (analyzed)
+|Full-text searchable content. Tokenized and indexed.
+
+|`createStringField(name, value)`
+|StringField (not analyzed)
+|Exact match only. Use for IDs, categories, status values.
+
+|`createIntField(name, value)`
+|IntPoint
+|Numeric integer values. Supports range queries.
+
+|`createLongField(name, value)`
+|LongPoint
+|Numeric long values. Supports range queries.
+
+|`createFloatField(name, value)`
+|FloatPoint
+|Numeric float values. Supports range queries.
+
+|`createDoubleField(name, value)`
+|DoublePoint
+|Numeric double values. Supports range queries.
+|===
+
+=== Field Type Examples
+
+[source, java]
+----
+public class ProductDocumentPopulator extends DocumentPopulator<Product>
+{
+    @Override
+    public void populate(Document document, Product product)
+    {
+        // Full-text searchable
+        document.add(createTextField("name", product.getName()));
+        document.add(createTextField("description", product.getDescription()));
+
+        // Exact match only
+        document.add(createStringField("sku", product.getSku()));
+        document.add(createStringField("category", product.getCategory()));
+
+        // Numeric fields for range queries
+        document.add(createDoubleField("price", product.getPrice()));
+        document.add(createIntField("quantity", product.getQuantity()));
+    }
+}
+----
+
+== Query Syntax
+
+The Lucene index supports the full https://lucene.apache.org/core/9_8_0/queryparser/org/apache/lucene/queryparser/classic/package-summary.html[Lucene query syntax].
+
+=== Basic Queries
+
+[options="header",cols="1,2"]
+|===
+|Query |Description
+
+|`title:Python`
+|Field contains term "Python"
+
+|`Python`
+|Default field contains "Python"
+
+|`title:"Machine Learning"`
+|Phrase search (exact sequence)
+
+|`title:Py*`
+|Wildcard (starts with "Py")
+
+|`title:Pythn~`
+|Fuzzy search (similar spelling)
+|===
+
+=== Boolean Queries
+
+[options="header",cols="1,2"]
+|===
+|Query |Description
+
+|`title:Python AND author:Jane`
+|Both conditions must match
+
+|`title:Python OR title:Java`
+|Either condition matches
+
+|`title:Python NOT deprecated`
+|Exclude results containing "deprecated"
+
+|`+title:Python -draft`
+|Must have "Python", must not have "draft"
+|===
+
+=== Range Queries
+
+[source, java]
+----
+// Text range
+luceneIndex.query("author:[A TO M]");  // Authors A through M
+
+// Numeric range (requires native Query object)
+Query priceRange = DoublePoint.newRangeQuery("price", 10.0, 100.0);
+List<Product> affordable = luceneIndex.query(priceRange);
+----
+
+== Result Handling
+
+=== Basic Query
+
+[source, java]
+----
+// Returns all matching entities
+List<Article> results = luceneIndex.query("title:Python");
+----
+
+=== Limited Results
+
+[source, java]
+----
+// Returns at most 10 results
+List<Article> top10 = luceneIndex.query("title:Python", 10);
+----
+
+=== With Relevance Scores
+
+[source, java]
+----
+// Access entity ID, entity, and relevance score
+luceneIndex.query("title:Python", (entityId, article, score) -> {
+    System.out.println(article.getTitle() + " (score: " + score + ")");
+});
+
+// With result limit
+luceneIndex.query("title:Python", 10, (entityId, article, score) -> {
+    System.out.println(article.getTitle() + " (score: " + score + ")");
+});
+----
+
+=== Composable Search Result
+
+`search(...)` returns a `LuceneSearchResult` — an iterable of `(entityId, entity, score)` entries that is also a xref:queries/defining.adoc#_sub_queries[`GigaMap.SubQuery`].
+
+[source, java]
+----
+LuceneSearchResult<Article> hits = luceneIndex.search("title:Python", 50);
+
+// Iterate with scores
+for(ScoredSearchResult.Entry<Article> entry : hits)
+{
+    System.out.println(entry.entity().getTitle() + " (" + entry.score() + ")");
+}
+
+// Narrow by a bitmap condition; keep scores on the result
+ScoredSearchResult<Article> published = hits.and(gigaMap.query(status.is("PUBLISHED")));
+
+// Or start from the bitmap side
+List<Article> publishedList = gigaMap.query(status.is("PUBLISHED"))
+    .and(hits)
+    .toList();
+----
+
+== Persistence
+
+The Lucene index supports three storage options:
+
+=== Embedded Storage (Default)
+
+Stores index data inside the GigaMap's object graph. The index is persisted automatically when the GigaMap is stored.
+
+[source, java]
+----
+// No directory specified - uses embedded storage
+LuceneContext<Article> context = LuceneContext.New(
+    new ArticleDocumentPopulator()
+);
+----
+
+=== File System Storage
+
+Stores index data in a directory on the file system using memory-mapped files.
+
+[source, java]
+----
+// Specify directory path - uses MMapDirectory
+LuceneContext<Article> context = LuceneContext.New(
+    Paths.get("/data/lucene-index"),
+    new ArticleDocumentPopulator()
+);
+----
+
+=== In-Memory Storage
+
+Stores index data in memory. Useful for testing or temporary indexes.
+
+[source, java]
+----
+// Use ByteBuffersDirectory for in-memory storage
+LuceneContext<Article> context = LuceneContext.New(
+    DirectoryCreator.ByteBuffers(),
+    new ArticleDocumentPopulator()
+);
+----
+
+== Integration with {product-name}
+
+[source, java]
+----
+try (EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+{
+    GigaMap<Article> articles = GigaMap.New();
+    storage.setRoot(articles);
+
+    LuceneContext<Article> context = LuceneContext.New(new ArticleDocumentPopulator());
+    LuceneIndex<Article> luceneIndex = articles.index().register(LuceneIndex.Category(context));
+
+    articles.add(new Article("Title", "Content", "Author"));
+
+    storage.storeRoot();
+}
+----
+
+== Further Reading
+
+* xref:indexing/lucene/configuration.adoc[Configuration Options]
+* xref:indexing/lucene/use-cases.adoc[Use Cases]
+* xref:indexing/lucene/advanced.adoc[Advanced Usage]

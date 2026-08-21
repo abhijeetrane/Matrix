@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+	<modelVersion>4.0.0</modelVersion>
+
+	<parent>
+		<groupId>org.eclipse.store</groupId>
+		<artifactId>afs-aws-parent</artifactId>
+		<version>5.0.0-SNAPSHOT</version>
+		<relativePath>../pom.xml</relativePath>
+	</parent>
+
+	<artifactId>afs-aws-s3</artifactId>
+	
+	<name>EclipseStore Abstract File System AWS S3</name>
+	<description>EclipseStore File System Abstraction for AWS S3</description>
+	<url>https://projects.eclipse.org/projects/technology.store</url>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.eclipse.store</groupId>
+			<artifactId>afs-aws</artifactId>
+			<version>${project.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>s3</artifactId>
+            <version>${aws.sdk.version}</version>
+			<scope>provided</scope>
+		</dependency>
+	</dependencies>
+
+</project>

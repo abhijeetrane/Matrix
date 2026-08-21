@@ -1,0 +1,3422 @@
+package org.eclipse.store.gigamap.jvector;
+
+/*-
+ * #%L
+ * EclipseStore GigaMap JVector
+ * %%
+ * Copyright (C) 2023 - 2026 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import io.github.jbellis.jvector.graph.*;
+import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
+import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
+import io.github.jbellis.jvector.graph.similarity.SearchScoreProvider;
+import io.github.jbellis.jvector.util.Bits;
+import io.github.jbellis.jvector.util.ExplicitThreadLocal;
+import io.github.jbellis.jvector.vector.VectorizationProvider;
+import io.github.jbellis.jvector.vector.types.VectorFloat;
+import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
+import org.eclipse.serializer.collections.BulkList;
+import org.eclipse.serializer.exceptions.IORuntimeException;
+import org.eclipse.serializer.persistence.binary.types.BinaryTypeHandler;
+import org.eclipse.serializer.persistence.types.Storer;
+import org.eclipse.store.gigamap.types.AbstractStateChangeFlagged;
+import org.eclipse.store.gigamap.types.BitmapIndex;
+import org.eclipse.store.gigamap.types.GigaIndex;
+import org.eclipse.store.gigamap.types.GigaMap;
+import org.eclipse.store.gigamap.types.ScoredSearchResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.IntStream;
+
+import static org.eclipse.serializer.math.XMath.positive;
+
+/**
+ * A vector index that enables k-nearest-neighbor (k-NN) similarity search on entities.
+ * <p>
+ * This index uses the HNSW (Hierarchical Navigable Small World) algorithm, a graph-based
+ * approximate nearest neighbor search algorithm that provides excellent query performance
+ * with high recall. Entities are indexed by their vector representation, allowing you to
+ * find the most similar entities to a given query vector.
+ *
+ * <h2>Key Features</h2>
+ * <ul>
+ *   <li><b>High Performance</b> - Sub-linear query time complexity via hierarchical graph navigation</li>
+ *   <li><b>High Recall</b> - Configurable trade-offs between speed and accuracy</li>
+ *   <li><b>Persistence</b> - Full integration with GigaMap's persistence layer</li>
+ *   <li><b>On-Disk Storage</b> - Optional memory-mapped indices for large datasets</li>
+ *   <li><b>PQ Compression</b> - Product Quantization for reduced memory footprint</li>
+ *   <li><b>Background Optimization</b> - Automatic graph cleanup for improved performance</li>
+ *   <li><b>Eventual Indexing</b> - Deferred graph mutations via background thread for reduced write latency</li>
+ *   <li><b>Parallel On-Disk Writes</b> - Multi-threaded index persistence for large on-disk indices</li>
+ * </ul>
+ *
+ * <h2>Basic Usage</h2>
+ * <pre>{@code
+ * // 1. Create a GigaMap and register VectorIndices
+ * GigaMap<Document> gigaMap = GigaMap.New();
+ * VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+ *
+ * // 2. Configure and create a vector index
+ * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+ *     .dimension(768)                                    // Must match your embedding size
+ *     .similarityFunction(VectorSimilarityFunction.COSINE)
+ *     .build();
+ *
+ * VectorIndex<Document> index = vectorIndices.add(
+ *     "embeddings",                                      // Index name
+ *     config,
+ *     new DocumentVectorizer()                           // Extracts vectors from entities
+ * );
+ *
+ * // 3. Add entities (automatically indexed)
+ * gigaMap.add(new Document("Hello world", embedding1));
+ * gigaMap.add(new Document("Hello there", embedding2));
+ *
+ * // 4. Search for similar entities
+ * float[] queryVector = computeEmbedding("Hello");
+ * VectorSearchResult<Document> results = index.search(queryVector, 10);
+ *
+ * for (ScoredSearchResult.Entry<Document> entry : results) {
+ *     Document doc = entry.entity();      // Lazy lookup via GigaMap
+ *     float similarity = entry.score();   // Similarity score
+ *     System.out.println(doc.content() + " (score: " + similarity + ")");
+ * }
+ * }</pre>
+ *
+ * <h2>Vectorizer Implementation</h2>
+ * The {@link Vectorizer} extracts vector representations from entities. Two modes are supported:
+ *
+ * <h3>Embedded Mode (vectors stored in entity)</h3>
+ * Use when vectors are already part of your entity:
+ * <pre>{@code
+ * class DocumentVectorizer extends Vectorizer<Document> {
+ *     @Override
+ *     public float[] vectorize(Document doc) {
+ *         return doc.embedding();  // Vector already in entity
+ *     }
+ *
+ *     @Override
+ *     public boolean isEmbedded() {
+ *         return true;  // Don't duplicate storage
+ *     }
+ * }
+ * }</pre>
+ *
+ * <h3>Computed Mode (vectors stored separately)</h3>
+ * Use when vectors are computed externally (e.g., from an embedding API):
+ * <pre>{@code
+ * class ComputedVectorizer extends Vectorizer<Document> {
+ *     private final EmbeddingService embeddingService;
+ *
+ *     @Override
+ *     public float[] vectorize(Document doc) {
+ *         return embeddingService.embed(doc.content());
+ *     }
+ *
+ *     // isEmbedded() defaults to false - vectors stored in VectorIndex
+ * }
+ * }</pre>
+ *
+ * <h2>On-Disk Storage</h2>
+ * For large datasets that exceed available memory:
+ * <pre>{@code
+ * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+ *     .dimension(768)
+ *     .similarityFunction(VectorSimilarityFunction.COSINE)
+ *     .onDisk(true)
+ *     .indexDirectory(Path.of("/data/vectors"))
+ *     .enablePqCompression(true)     // Optional: reduce memory with Product Quantization
+ *     .pqSubspaces(48)               // Must divide dimension evenly
+ *     .build();
+ * }</pre>
+ *
+ * <h2>Background Persistence</h2>
+ * Automatically persist the index at regular intervals (enabled by setting interval &gt; 0):
+ * <pre>{@code
+ * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+ *     .dimension(768)
+ *     .onDisk(true)
+ *     .indexDirectory(Path.of("/data/vectors"))
+ *     .persistenceIntervalMs(30_000)      // Enable, check every 30 seconds
+ *     .minChangesBetweenPersists(100)     // Only persist if >= 100 changes
+ *     .persistOnShutdown(true)            // Persist on close()
+ *     .build();
+ * }</pre>
+ *
+ * <h2>Background Optimization</h2>
+ * Periodically clean up the graph to reduce memory and improve query latency
+ * (enabled by setting interval &gt; 0):
+ * <pre>{@code
+ * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+ *     .dimension(768)
+ *     .optimizationIntervalMs(60_000)          // Enable, check every 60 seconds
+ *     .minChangesBetweenOptimizations(1000)    // Only optimize if >= 1000 changes
+ *     .optimizeOnShutdown(false)               // Skip on close() for faster shutdown
+ *     .build();
+ * }</pre>
+ *
+ * <h2>Eventual Indexing</h2>
+ * When enabled, expensive HNSW graph mutations (add, update, remove) are deferred to a background
+ * thread. The vector store is still updated synchronously, so no data is lost, but graph construction
+ * happens asynchronously. This reduces the latency of mutation operations at the cost of eventual
+ * consistency — search results may not immediately reflect the most recent mutations.
+ * <p>
+ * The graph is automatically drained (all pending operations applied) before
+ * {@code optimize()}, {@code persistToDisk()}, and {@code close()}.
+ * <pre>{@code
+ * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+ *     .dimension(768)
+ *     .similarityFunction(VectorSimilarityFunction.COSINE)
+ *     .eventualIndexing(true)
+ *     .build();
+ * }</pre>
+ *
+ * <h2>Parallel On-Disk Writes</h2>
+ * When on-disk storage is enabled, persistence can optionally use parallel direct buffers and
+ * multiple worker threads (one per available processor) to write the index concurrently. This can
+ * significantly speed up persistence for large indices. Disabled by default, as sequential
+ * single-threaded writing is preferred in resource-constrained environments or for smaller indices.
+ * <pre>{@code
+ * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+ *     .dimension(768)
+ *     .similarityFunction(VectorSimilarityFunction.COSINE)
+ *     .onDisk(true)
+ *     .indexDirectory(Path.of("/data/vectors"))
+ *     .parallelOnDiskWrite(true)
+ *     .build();
+ * }</pre>
+ *
+ * <h2>Search Methods</h2>
+ * <pre>{@code
+ * // Search by vector
+ * VectorSearchResult<Document> results = index.search(queryVector, 10);
+ *
+ * // Search by entity (uses vectorizer to extract query vector)
+ * VectorSearchResult<Document> results = index.search(queryDocument, 10);
+ *
+ * // Manual optimization
+ * index.optimize();
+ *
+ * // Manual persistence (for on-disk indices)
+ * index.persistToDisk();
+ * }</pre>
+ *
+ * <h2>Working with Results</h2>
+ * <pre>{@code
+ * VectorSearchResult<Document> results = index.search(queryVector, 10);
+ *
+ * // Iterate
+ * for (ScoredSearchResult.Entry<Document> entry : results) {
+ *     System.out.println(entry.entity().content());
+ * }
+ *
+ * // Stream API
+ * List<String> titles = results.stream()
+ *     .filter(e -> e.score() > 0.8f)
+ *     .map(e -> e.entity().title())
+ *     .toList();
+ *
+ * // Convert to list
+ * List<ScoredSearchResult.Entry<Document>> list = results.toList();
+ * }</pre>
+ *
+ * <h2>Persistence with EclipseStore</h2>
+ * <pre>{@code
+ * // Save
+ * try (EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir)) {
+ *     GigaMap<Document> gigaMap = GigaMap.New();
+ *     storage.setRoot(gigaMap);
+ *
+ *     VectorIndices<Document> indices = gigaMap.index().register(VectorIndices.Category());
+ *     VectorIndex<Document> index = indices.add("embeddings", config, vectorizer);
+ *
+ *     gigaMap.add(document1);
+ *     gigaMap.add(document2);
+ *
+ *     storage.storeRoot();
+ * }
+ *
+ * // Load
+ * try (EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir)) {
+ *     GigaMap<Document> gigaMap = storage.root();
+ *     VectorIndices<Document> indices = gigaMap.index().get(VectorIndices.Category());
+ *     VectorIndex<Document> index = indices.get("embeddings");
+ *
+ *     // Search works immediately after load
+ *     VectorSearchResult<Document> results = index.search(queryVector, 10);
+ * }
+ * }</pre>
+ *
+ * <h2>Thread Safety</h2>
+ * <ul>
+ *   <li><b>Search</b> - Thread-safe, multiple concurrent searches allowed</li>
+ *   <li><b>Add/Remove</b> - Thread-safe via GigaMap synchronization</li>
+ *   <li><b>Optimization</b> - Briefly blocks add/remove/search during cleanup</li>
+ *   <li><b>Eventual Indexing</b> - Graph mutations are applied sequentially by a single
+ *       background worker thread; vector store updates remain synchronous</li>
+ * </ul>
+ *
+ * <h2>Limitations</h2>
+ * <ul>
+ *   <li><b>~2.1 billion vectors per index</b> - Graph ordinals use {@code int}. For larger
+ *       datasets, implement sharding across multiple indices.</li>
+ *   <li><b>Fixed dimension</b> - All vectors must have exactly the configured dimension.</li>
+ * </ul>
+ *
+ * @param <E> the entity type
+ * @see VectorIndices
+ * @see VectorIndexConfiguration
+ * @see VectorSearchResult
+ * @see Vectorizer
+ */
+public interface VectorIndex<E> extends GigaIndex<E>, Closeable
+{
+    /**
+     * Returns the parent VectorIndices associated with this VectorIndex.
+     *
+     * @return the parent VectorIndices instance
+     */
+    public VectorIndices<E> parent();
+
+    /**
+     * Returns the vectorizer used by this index.
+     *
+     * @return the vectorizer
+     */
+    public Vectorizer<? super E> vectorizer();
+
+    /**
+     * Returns the configuration of this index.
+     *
+     * @return the index configuration
+     */
+    public VectorIndexConfiguration configuration();
+
+    @Override
+    public default boolean isSuitableAsUniqueConstraint()
+    {
+        // Vector indices cannot serve as unique constraints
+        return false;
+    }
+
+    /**
+     * Searches for the k nearest neighbors to the query vector.
+     * <p>
+     * This method performs an approximate nearest neighbor (ANN) search using the HNSW
+     * algorithm. Results are returned in descending order of similarity score, with
+     * the most similar entity first.
+     *
+     * <h4>Example</h4>
+     * <pre>{@code
+     * float[] queryVector = embeddingService.embed("search query");
+     * VectorSearchResult<Document> results = index.search(queryVector, 10);
+     *
+     * for (ScoredSearchResult.Entry<Document> entry : results) {
+     *     System.out.printf("Score: %.4f - %s%n",
+     *         entry.score(),
+     *         entry.entity().title()
+     *     );
+     * }
+     * }</pre>
+     *
+     * <h4>Similarity Scores</h4>
+     * The score interpretation depends on the configured {@link VectorSimilarityFunction}:
+     * <ul>
+     *   <li><b>COSINE</b> - Range [-1, 1], where 1 = identical, 0 = orthogonal, -1 = opposite</li>
+     *   <li><b>DOT_PRODUCT</b> - Unbounded, higher = more similar (use with normalized vectors)</li>
+     *   <li><b>EUCLIDEAN</b> - Range [0, ∞), lower = more similar (converted to similarity internally)</li>
+     * </ul>
+     *
+     * <h4>Thread Safety</h4>
+     * This method is thread-safe. Multiple concurrent searches are allowed and will not
+     * block each other. However, searches may briefly block during background optimization
+     * or persistence operations.
+     *
+     * <h4>Performance Notes</h4>
+     * <ul>
+     *   <li>Query time is sub-linear: O(log n) average case</li>
+     *   <li>Larger k values increase query time</li>
+     *   <li>Higher {@link VectorIndexConfiguration#beamWidth()} improves recall but increases latency</li>
+     * </ul>
+     *
+     * @param queryVector the query vector; must have exactly {@link VectorIndexConfiguration#dimension()} elements
+     * @param k           the number of nearest neighbors to return; must be positive
+     * @return the search result containing up to k entries with entity IDs, similarity scores,
+     *         and lazy entity access; never null but may contain fewer than k results if the
+     *         index has fewer entities
+     * @throws IllegalArgumentException if queryVector is null, has wrong dimension, or k &lt;= 0
+     * @see #search(Object, int)
+     * @see VectorSearchResult
+     */
+    public VectorSearchResult<E> search(float[] queryVector, int k);
+
+    /**
+     * Searches for the k nearest neighbors with an explicit per-query search beam width
+     * (HNSW <i>efSearch</i>).
+     * <p>
+     * This overload overrides the configured floor from
+     * {@link VectorIndexConfiguration#minSearchBeamWidth()} for a single call. The effective
+     * beam width is {@code max(k, searchBeamWidth)} because jvector requires the beam width
+     * to be at least as large as the requested {@code k}.
+     * <p>
+     * Use this to widen exploration (e.g. {@code searchBeamWidth=500} for higher recall) or
+     * to narrow it (e.g. {@code searchBeamWidth=k} for minimum latency when reproducibility
+     * across different {@code k} values is not required).
+     *
+     * @param queryVector      the query vector; must have exactly
+     *                         {@link VectorIndexConfiguration#dimension()} elements
+     * @param k                the number of nearest neighbors to return; must be positive
+     * @param searchBeamWidth  the beam width to use for this query; must be positive
+     * @return the search result
+     * @throws IllegalArgumentException if queryVector is null, has wrong dimension, or
+     *                                  {@code k} / {@code searchBeamWidth} are not positive
+     * @see #search(float[], int)
+     * @see VectorIndexConfiguration#minSearchBeamWidth()
+     */
+    public VectorSearchResult<E> search(float[] queryVector, int k, int searchBeamWidth);
+
+    /**
+     * Searches for the k nearest neighbors to the given entity's vector.
+     * <p>
+     * This is a convenience method that extracts the vector from the query entity using
+     * the configured {@link Vectorizer}, then delegates to {@link #search(float[], int)}.
+     *
+     * <h4>Example</h4>
+     * <pre>{@code
+     * // Find documents similar to an existing document
+     * Document referenceDoc = gigaMap.get(documentId);
+     * VectorSearchResult<Document> similar = index.search(referenceDoc, 5);
+     *
+     * // The reference document itself will typically be the first result (score ≈ 1.0)
+     * similar.stream()
+     *     .skip(1)  // Skip self-match
+     *     .forEach(entry -> System.out.println(entry.entity().title()));
+     * }</pre>
+     *
+     * <h4>Use Cases</h4>
+     * <ul>
+     *   <li><b>Find similar items</b> - "More like this" recommendations</li>
+     *   <li><b>Duplicate detection</b> - Find near-duplicates of an entity</li>
+     *   <li><b>Clustering verification</b> - Check which entities are most similar</li>
+     * </ul>
+     *
+     * @param queryEntity the query entity whose vector will be extracted via the vectorizer;
+     *                    must not be null
+     * @param k           the number of nearest neighbors to return; must be positive
+     * @return the search result containing up to k entries; never null
+     * @throws IllegalArgumentException if queryEntity is null, k &lt;= 0, or the vectorizer
+     *                                  returns null for the entity (an entity without an
+     *                                  embedding cannot be used as a similarity query)
+     * @see #search(float[], int)
+     * @see Vectorizer#vectorize(Object)
+     */
+    public default VectorSearchResult<E> search(final E queryEntity, final int k)
+    {
+        return this.search(this.requireQueryVector(queryEntity), k);
+    }
+
+    /**
+     * Searches for the k nearest neighbors to the given entity's vector with an explicit
+     * per-query search beam width.
+     *
+     * @param queryEntity     the query entity whose vector will be extracted via the vectorizer;
+     *                        must not be null
+     * @param k               the number of nearest neighbors to return; must be positive
+     * @param searchBeamWidth the beam width to use for this query; must be positive
+     * @return the search result
+     * @throws IllegalArgumentException if queryEntity is null, {@code k} / {@code searchBeamWidth}
+     *                                  are not positive, or the vectorizer returns null for the
+     *                                  entity (an entity without an embedding cannot be used as
+     *                                  a similarity query)
+     * @see #search(float[], int, int)
+     */
+    public default VectorSearchResult<E> search(final E queryEntity, final int k, final int searchBeamWidth)
+    {
+        return this.search(this.requireQueryVector(queryEntity), k, searchBeamWidth);
+    }
+
+    /**
+     * Extracts the query vector from the given entity, rejecting both a null entity and a null
+     * result: an entity without an embedding has no meaningful similarity and cannot be used as
+     * a query.
+     *
+     * @param queryEntity the query entity; must not be null
+     * @return the non-null query vector
+     * @throws IllegalArgumentException if the entity is null, or the vectorizer returns null for it
+     */
+    private float[] requireQueryVector(final E queryEntity)
+    {
+        if(queryEntity == null)
+        {
+            throw new IllegalArgumentException("Query entity must not be null");
+        }
+        final float[] queryVector = this.vectorizer().vectorize(queryEntity);
+        if(queryVector == null)
+        {
+            throw new IllegalArgumentException(
+                "Query entity has no vector: the vectorizer returned null. "
+                    + "Entities without embeddings cannot be used as similarity queries."
+            );
+        }
+        return queryVector;
+    }
+
+    /**
+     * Performs cleanup and optimization of the index graph structure.
+     * <p>
+     * This method removes excess neighbor connections that accumulate during graph
+     * construction, reducing memory usage and improving query latency. It is recommended
+     * to call this periodically after bulk insertions or when query performance degrades.
+     *
+     * <h4>Example</h4>
+     * <pre>{@code
+     * // After bulk insertion
+     * for (Document doc : documents) {
+     *     gigaMap.add(doc);
+     * }
+     * index.optimize();  // Clean up the graph
+     *
+     * // Or on a schedule
+     * scheduler.scheduleAtFixedRate(
+     *     () -> index.optimize(),
+     *     1, 1, TimeUnit.HOURS
+     * );
+     * }</pre>
+     *
+     * <h4>Background Optimization</h4>
+     * Instead of calling this method manually, you can enable automatic background
+     * optimization by setting {@code optimizationIntervalMs} to a value greater than 0:
+     * <pre>{@code
+     * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+     *     .dimension(768)
+     *     .optimizationIntervalMs(60_000)
+     *     .minChangesBetweenOptimizations(1000)
+     *     .build();
+     * }</pre>
+     *
+     * <h4>Thread Safety</h4>
+     * This method acquires an exclusive lock on the graph structure. While optimization
+     * is running:
+     * <ul>
+     *   <li>Add/remove operations will block until optimization completes</li>
+     *   <li>Search operations will block until optimization completes</li>
+     * </ul>
+     * For large indices, consider using background optimization to minimize disruption.
+     *
+     * <h4>When to Optimize</h4>
+     * <ul>
+     *   <li>After adding many entities (e.g., &gt;1000)</li>
+     *   <li>After removing many entities</li>
+     *   <li>When query latency increases noticeably</li>
+     *   <li>Periodically (e.g., hourly or daily) for continuously updated indices</li>
+     * </ul>
+     *
+     * @see VectorIndexConfiguration#backgroundOptimization()
+     * @see VectorIndexConfiguration#optimizationIntervalMs()
+     */
+    public void optimize();
+
+    /**
+     * Persists the index to disk if on-disk mode is enabled.
+     * <p>
+     * For on-disk indices, this writes the graph structure and metadata to the configured
+     * {@link VectorIndexConfiguration#indexDirectory()}. If PQ compression is enabled, the
+     * compressed vectors are embedded in the graph file.
+     * <p>
+     * For in-memory indices ({@link #isOnDisk()} returns false), this method is a no-op.
+     *
+     * <h4>Files Created</h4>
+     * <ul>
+     *   <li><code>{indexName}.graph</code> - The HNSW graph structure</li>
+     *   <li><code>{indexName}.meta</code> - Metadata including vector count and configuration</li>
+     * </ul>
+     *
+     * <h4>Example</h4>
+     * <pre>{@code
+     * // Manual persistence after bulk operations
+     * for (Document doc : documents) {
+     *     gigaMap.add(doc);
+     * }
+     * index.persistToDisk();
+     *
+     * // Or before application shutdown
+     * Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+     *     try {
+     *         index.persistToDisk();
+     *     } catch (IOException e) {
+     *         logger.error("Failed to persist index", e);
+     *     }
+     * }));
+     * }</pre>
+     *
+     * <h4>Background Persistence</h4>
+     * Instead of calling this method manually, you can enable automatic background
+     * persistence by setting {@code persistenceIntervalMs} to a value greater than 0:
+     * <pre>{@code
+     * VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+     *     .dimension(768)
+     *     .onDisk(true)
+     *     .indexDirectory(Path.of("/data/vectors"))
+     *     .persistenceIntervalMs(30_000)
+     *     .minChangesBetweenPersists(100)
+     *     .persistOnShutdown(true)
+     *     .build();
+     * }</pre>
+     *
+     * <h4>Thread Safety</h4>
+     * This method acquires a write lock that blocks concurrent searches during persistence.
+     * Add/remove operations are also blocked. For minimal disruption, prefer background
+     * persistence or call during low-traffic periods.
+     *
+     * <h4>Recovery</h4>
+     * On restart, the persisted graph is automatically loaded if the files exist and are
+     * valid. If the files are corrupted or the vector count doesn't match, the graph is
+     * rebuilt from the stored vectors.
+     *
+     * @see #isOnDisk()
+     * @see VectorIndexConfiguration#indexDirectory()
+     * @see VectorIndexConfiguration#backgroundPersistence()
+     */
+    public void persistToDisk();
+
+    /**
+     * Returns whether the index is configured for on-disk storage.
+     * <p>
+     * On-disk indices store the graph structure in memory-mapped files, allowing indices
+     * larger than available RAM. The trade-off is slightly higher query latency compared
+     * to fully in-memory indices.
+     *
+     * @return true if on-disk mode is enabled via {@link VectorIndexConfiguration#onDisk()}
+     * @see VectorIndexConfiguration#onDisk()
+     * @see VectorIndexConfiguration#indexDirectory()
+     */
+    public default boolean isOnDisk()
+    {
+        return this.configuration().onDisk();
+    }
+
+    /**
+     * Returns whether Product Quantization (PQ) compression is enabled for this index.
+     * <p>
+     * PQ compression reduces memory usage by encoding vectors into compact codes, at the
+     * cost of some accuracy loss. This is particularly useful for large indices where
+     * memory is constrained.
+     * <p>
+     * <b>Note:</b> PQ compression requires on-disk mode to be enabled.
+     *
+     * @return true if PQ compression is enabled via {@link VectorIndexConfiguration#enablePqCompression()}
+     * @see VectorIndexConfiguration#enablePqCompression()
+     * @see VectorIndexConfiguration#pqSubspaces()
+     */
+    public default boolean isPqCompressionEnabled()
+    {
+        return this.configuration().enablePqCompression();
+    }
+
+    /**
+     * Retrieves the vector associated with the given entity ID.
+     * <p>
+     * If the vectorizer is embedded, the vector is computed on-the-fly from the entity
+     * stored in the parent map. Otherwise, the vector is looked up from the vector store.
+     *
+     * <h4>Example</h4>
+     * <pre>{@code
+     * float[] vector = index.getVector(entityId);
+     * if (vector != null) {
+     *     System.out.println("Vector dimension: " + vector.length);
+     * }
+     * }</pre>
+     *
+     * @param entityId the entity ID whose vector to retrieve
+     * @return the vector as a float array, or {@code null} if the entity has no vector — either
+     *         because no such entity is indexed, or because the entity has no embedding (when
+     *         the vectorizer {@link Vectorizer#allowsNullVectors() allows null vectors})
+     */
+    public float[] getVector(long entityId);
+
+    /**
+     * Closes the index and releases all associated resources.
+     * <p>
+     * This method should be called when the index is no longer needed. It performs
+     * the following cleanup in order:
+     * <ol>
+     *   <li>Shuts down background optimization (optionally runs final optimization
+     *       if {@link VectorIndexConfiguration#optimizeOnShutdown()} is enabled)</li>
+     *   <li>Shuts down background persistence (optionally persists pending changes
+     *       if {@link VectorIndexConfiguration#persistOnShutdown()} is enabled)</li>
+     *   <li>Closes file handles and releases memory-mapped buffers (for on-disk indices)</li>
+     * </ol>
+     *
+     * <h4>Example</h4>
+     * <pre>{@code
+     * // Using try-with-resources (recommended)
+     * try (VectorIndex<Document> index = vectorIndices.add("embeddings", config, vectorizer)) {
+     *     // Use the index
+     *     VectorSearchResult<Document> results = index.search(queryVector, 10);
+     * }
+     * // Index is automatically closed
+     *
+     * // Or manual close
+     * VectorIndex<Document> index = vectorIndices.add("embeddings", config, vectorizer);
+     * try {
+     *     // Use the index
+     * } finally {
+     *     index.close();
+     * }
+     * }</pre>
+     *
+     * <h4>Thread Safety</h4>
+     * After calling close, the index should not be used. Subsequent calls to search,
+     * optimize, or persistToDisk may throw exceptions or produce undefined behavior.
+     *
+     * @see VectorIndexConfiguration#optimizeOnShutdown()
+     * @see VectorIndexConfiguration#persistOnShutdown()
+     */
+    @Override
+    public void close();
+
+    /**
+     * Internal interface with mutating methods hidden from public API.
+     *
+     * @param <E> the entity type
+     */
+    public interface Internal<E> extends VectorIndex<E>
+    {
+        public void internalAdd(long entityId, E entity);
+
+        public void internalAddAll(long firstEntityId, Iterable<? extends E> entities);
+
+        public default void internalAddAll(final long firstEntityId, final E[] entities)
+        {
+            this.internalAddAll(firstEntityId, Arrays.asList(entities));
+        }
+
+        public void internalUpdate(long entityId, E replacedEntity, E entity);
+
+        public void internalRemove(long entityId, E entity);
+
+        public void internalRemoveAll();
+
+        public void clearStateChangeMarkers();
+
+        /**
+         * Trains PQ codebook if compression is enabled and sufficient vectors exist.
+         * Called before persistence to ensure compressed vectors are ready.
+         */
+        public void trainCompressionIfNeeded();
+    }
+
+
+    /**
+     * Default implementation of VectorIndex using the HNSW graph algorithm.
+     * Vectors are stored in a separate GigaMap for lazy loading and persistence.
+     * Entity IDs are used directly as graph ordinals.
+     *
+     * @param <E> the entity type
+     */
+    public static class Default<E>
+    extends    AbstractStateChangeFlagged
+    implements VectorIndex.Internal<E>,
+               BackgroundTaskManager.Callback,
+               PQCompressionManager.VectorProvider,
+               DiskIndexManager.IndexStateProvider
+    {
+        private static final Logger LOG = LoggerFactory.getLogger(Default.class);
+
+        static BinaryTypeHandler<Default<?>> provideTypeHandler()
+        {
+            return BinaryHandlerVectorIndexDefault.New();
+        }
+
+
+        ///////////////////////////////////////////////////////////////////////////
+        // instance fields //
+        ////////////////////
+
+        final VectorIndices<E>           parent       ;
+        final String                     name         ;
+        final VectorIndexConfiguration   configuration;
+        final Vectorizer<? super E>      vectorizer   ;
+
+        // Vector storage - null if vectorizer.isEmbedded()
+        // Key: entity ID (used as ordinal), Value: vector
+        final GigaMap<VectorEntry> vectorStore;
+
+        // Persisted, monotonically increasing count of graph-affecting mutations (add / remove /
+        // vec↔null transition). It is the witness used to detect, on reload, whether the persisted
+        // GigaMap state has advanced past the on-disk graph: the value is stamped into the disk
+        // .meta at persist time and compared against the store-recovered value in
+        // DiskIndexManager.verifyMetadata. Unlike parentMap().size()/highestUsedId(), it changes on
+        // a vec↔null transition, so it catches the crash-restart window those proxies are blind to.
+        // Not transient — it must survive (de)serialization.
+        long structuralModCount;
+
+        // HNSW graph components (transient - rebuilt on load)
+        // Volatile: the pair is swapped wholesale by exitIncrementalMode / reenterIncrementalMode /
+        // initializeInMemoryBuilder under builderLock.writeLock(), but read by sync-mode mutations and
+        // by drainDeferredBuilderOps, neither of which holds that lock. Without volatile a reader can
+        // observe a torn pair (stale index, fresh builder), which is how a guard evaluated on `index`
+        // ended up authorizing a mutation on a different `builder` (internal #142). Code that mutates
+        // the graph must additionally read `builder` ONCE into a local and derive the graph from it
+        // (see internalReplaceGraphNode) so guard and mutation cannot target different objects.
+        private transient VectorTypeSupport          vectorTypeSupport;
+        private transient volatile GraphIndexBuilder builder          ;
+        private transient volatile OnHeapGraphIndex  index            ;
+
+        // Managers (transient - recreated on load)
+        private transient DiskIndexManager      diskManager          ;
+        private transient PQCompressionManager  pqManager            ;
+                transient BackgroundTaskManager backgroundTaskManager;
+
+        // GraphSearcher pool for thread-local reuse
+        private transient ExplicitThreadLocal<GraphSearcher> inMemorySearcherPool;
+
+        // Computed-mode fast index: source entity id (graph ordinal) -> vector store's own
+        // internal entity id. Lets vector lookups use a direct, lazy vectorStore.get(internalId)
+        // instead of an index query per call (which is far too costly on the hot scoring path),
+        // while still resolving by source entity id so it stays correct when the store's id
+        // allocator drifts from the parent's (deletion holes, or entities without an embedding
+        // that get no store entry). Null in embedded mode.
+        //
+        // Built lazily on first access via computedIdIndex(): from the vector store's identity index
+        // bitmaps (cheap, loads no VectorEntry / no vectors) once the store is queryable, falling back
+        // to a positional store scan during the deserialization window when the index registry is not
+        // yet wired. Deferring the build off the load path is what keeps incremental on-disk startup
+        // O(1) in the vector payload.
+        //
+        // Concurrency: a ConcurrentHashMap. The volatile FIELD is published (assigned) once under the
+        // vector store's own monitor by the double-checked lazy build in computedIdIndex() (a leaf
+        // lock — see there); search threads read it lock-free. Per-entry put/remove by mutations are
+        // not synchronized on that monitor — they rely on the map's own thread-safety and are serialized
+        // against each other by the parent GigaMap monitor the mutation already holds.
+        private transient volatile Map<Long, Long> computedIdIndex;
+
+        // One-shot guard for the deferred graph rebuild. The HNSW graph is transient and must be
+        // rebuilt from the store after deserialization, but that rebuild iterates the parent GigaMap
+        // / vector store (a nested object-graph load) and therefore may NOT run inside the enclosing
+        // deserialization's complete() phase (internal #87). So complete() only does the nested-load-
+        // free transient setup (initializeAfterLoad -> initializeIndex); the graph rebuild is deferred
+        // to the first search/mutation/optimize via ensureGraphRebuilt(), which runs it exactly once
+        // under the parent GigaMap monitor (see there). Volatile: fast-path read lock-free; the actual
+        // rebuild + set happens under synchronized(parentMap()). Also set true by the runtime rebuild
+        // in exitIncrementalMode() so it is not repeated, and by the standard constructor, to keep the
+        // deferred rebuild from racing the one-time registration back-fill that populates a newly
+        // created index (see there).
+        private transient volatile boolean                   graphRebuilt       ;
+
+        // Incremental on-disk mode: after disk reload, use disk index for search
+        // and in-memory builder only for new mutations. Full rebuild deferred to persistToDisk().
+        // Volatile: written under writeLock (reenterIncrementalMode, exitIncrementalMode)
+        // but read by mutation methods (internalUpdate, internalRemove) under parentMap
+        // monitor only, without builderLock.
+        private transient volatile boolean                   incrementalMode    ;
+        private transient Set<Integer>                       diskDeletedOrdinals;
+        private transient ExplicitThreadLocal<GraphSearcher> diskSearcherPool    ;
+
+        // Read/write lock for builder operations.
+        // Read lock: concurrent searches and background-worker mutations
+        // Write lock: exclusive access for cleanup, persistence, removeAll, close
+        private transient ReentrantReadWriteLock builderLock;
+
+        // When true, sync-mode mutations defer builder ops to avoid racing with cleanup().
+        // cleanup()'s ForkJoinPool workers need the GigaMap monitor (for embedded vectorizers),
+        // so sync-mode mutations (which hold that monitor) cannot use builderLock — they use
+        // this flag instead. The synchronized(parentMap) barrier in optimize()/persistToDisk()
+        // ensures any in-flight mutation completes before cleanup begins.
+        private transient volatile boolean                cleanupInProgress;
+        private transient ConcurrentLinkedQueue<Runnable> deferredBuilderOps;
+
+        // Test-only seam: run once at the start of persist Phase 2 (parentMap monitor released,
+        // builder about to be swapped by reenterIncrementalMode). Lets a test deterministically inject
+        // a mutation into the exact window where a deferred builder op is drained after the swap.
+        // Null (and a no-op) in production. See VectorIndex(persist-window deletion) regression test.
+        transient volatile Runnable persistPhase2TestHook;
+
+        // Test-only seam: run on entry to drainDeferredBuilderOps, BEFORE the parentMap monitor is
+        // acquired. Lets a test collide two drains deterministically (persist thread vs application
+        // thread) to assert that the drain is serialized. Null (and a no-op) in production.
+        // See VectorIndexPersistWindowConcurrencyTest.
+        transient volatile Runnable drainEntryTestHook;
+
+
+        ///////////////////////////////////////////////////////////////////////////
+        // constructors //
+        /////////////////
+
+        /**
+         * Standard constructor for creating a new index. Sets up the transient state but leaves the graph
+         * empty: populating it with the entities the parent map already holds is the caller's job, done
+         * exactly once by {@code VectorIndices.Default#internalAddVectorIndex}.
+         */
+        Default(
+            final VectorIndices<E>         parent       ,
+            final String                   name         ,
+            final boolean                  stateChanged ,
+            final VectorIndexConfiguration configuration,
+            final Vectorizer<? super E>    vectorizer
+        )
+        {
+            super(stateChanged);
+
+            this.parent        = parent       ;
+            this.name          = name         ;
+            this.configuration = configuration;
+            this.vectorizer    = vectorizer   ;
+
+            this.vectorStore = vectorizer.isEmbedded()
+                ? null
+                : GigaMap.<VectorEntry>Builder()
+                    .withBitmapIdentityIndex(VectorEntry.SOURCE_ENTITY_ID_INDEXER)
+                    .build()
+            ;
+
+            // Initialize builder lock early (before initializeIndex)
+            this.builderLock         = new ReentrantReadWriteLock();
+            this.deferredBuilderOps  = new ConcurrentLinkedQueue<>();
+
+            // Publish the one-shot rebuild guard right away, so the deferred rebuild never runs for an
+            // index created here: this one is populated by the back-fill in
+            // VectorIndices.Default#internalAddVectorIndex, immediately after construction, and that is
+            // its single population path - embedded and computed alike. A rebuild would not find an empty
+            // source and stay a no-op: in embedded mode rebuildGraphFromStore() reads the *parent map*, so
+            // it would create a node per existing entity and the back-fill would then add each one a second
+            // time - jvector rejects the duplicate with "Node 0 already exists" (internal #123). Rebuilding
+            // from the store is meaningful only for an index that has a store to rebuild, i.e. after a load.
+            // Set before initializeIndex() so a background task started there cannot observe a false flag
+            // and rebuild behind the back-fill.
+            this.graphRebuilt = true;
+
+            // Transient setup only - deliberately NOT ensureIndexInitialized(), see above.
+            this.initializeIndex();
+        }
+
+        /**
+         * Constructor for binary handler deserialization.
+         */
+        @SuppressWarnings("unused")
+        Default()
+        {
+            super(false);
+            this.parent           = null;
+            this.name             = null;
+            this.configuration    = null;
+            this.vectorizer       = null;
+            this.vectorStore      = null;
+        }
+
+        /**
+         * Nested-load-free transient setup run from the binary handler's {@code complete()} during
+         * deserialization: (re)creates the transient managers, locks and (empty) in-memory builder,
+         * and, for on-disk indices, loads the disk graph. It deliberately does NOT rebuild the
+         * in-memory graph from the store, because that rebuild iterates the parent GigaMap / vector
+         * store (a nested object-graph load) which must not run inside the enclosing load's
+         * completeInstances phase (internal #87). The rebuild is deferred to first access via
+         * {@link #ensureGraphRebuilt()}.
+         */
+        void initializeAfterLoad()
+        {
+            final boolean diskLoaded = this.diskManager != null && this.diskManager.isLoaded();
+            if(this.builder == null && !diskLoaded)
+            {
+                this.initializeIndex();
+            }
+            // graph rebuild intentionally deferred to first access — see ensureGraphRebuilt()
+        }
+
+        /**
+         * Ensures the transient HNSW index is initialized and its graph rebuilt from the store.
+         * Called at the start of every search / mutation / optimize / persist entry point.
+         */
+        void ensureIndexInitialized()
+        {
+            final boolean diskLoaded = this.diskManager != null && this.diskManager.isLoaded();
+            if(this.builder == null && !diskLoaded)
+            {
+                this.initializeIndex();
+            }
+
+            this.ensureGraphRebuilt();
+        }
+
+        /**
+         * Rebuilds the in-memory graph from the store exactly once, lazily, on first access after a
+         * load — the step deferred out of {@code complete()} (internal #87). Runs under the parent
+         * GigaMap monitor: mutation / optimize / persist callers already hold it (reentrant), and the
+         * search path calls this before taking {@code builderLock.readLock()}, so it never holds the
+         * read lock and the monitor at the same time.
+         * <p>
+         * Deadlock-free despite the builder-swapping paths using opposite lock orders
+         * ({@code internalRemoveAll}: monitor then {@code builderLock.writeLock()};
+         * {@code doPersistToDisk}: write lock then monitor): the rebuild acquires NO
+         * {@code builderLock} while it holds the monitor — {@code addGraphNodesSequential} adds nodes
+         * to the builder directly, and {@code collectStoredVectors} only re-enters this monitor (and,
+         * in computed mode, the vector store's own leaf monitor). A thread rebuilding here therefore
+         * holds only the monitor and waits for no lock a write-lock holder needs, so it cannot sit in
+         * a monitor↔builderLock cycle.
+         * <p>
+         * Because every builder-swapping path also calls {@code ensureIndexInitialized()} before its
+         * swap, the first caller wins the rebuild under the monitor and publishes {@code graphRebuilt};
+         * all others see the flag and skip. Skipped in incremental on-disk mode (the disk index serves
+         * search; the in-memory graph is rebuilt later by {@code exitIncrementalMode}).
+         */
+        private void ensureGraphRebuilt()
+        {
+            if(this.graphRebuilt || this.incrementalMode)
+            {
+                return;
+            }
+            synchronized(this.parentMap())
+            {
+                if(this.graphRebuilt || this.incrementalMode)
+                {
+                    return;
+                }
+                this.rebuildGraphFromStore();
+                this.graphRebuilt = true;
+            }
+        }
+
+        /**
+         * Rebuilds the HNSW graph from stored data.
+         */
+        private void rebuildGraphFromStore()
+        {
+            final List<VectorEntry> entries = this.collectStoredVectors();
+
+            if(entries.isEmpty())
+            {
+                return;
+            }
+
+            this.addGraphNodesSequential(entries);
+        }
+
+        /**
+         * Returns the computed-mode {@link #computedIdIndex}, building it lazily on first access.
+         * {@code null} in embedded mode (or before the vector store exists).
+         * <p>
+         * The build is deferred out of {@code complete()}: at deserialization time the vector store's
+         * index registry is not yet queryable, and — more importantly — building eagerly there would
+         * reintroduce the O(n) I/O + heap spike that incremental on-disk mode exists to avoid. On first
+         * access the map is reconstructed cheaply from the identity index bitmaps (no {@link VectorEntry},
+         * no vectors); see {@link #buildComputedIdIndex()}.
+         * <p>
+         * Thread-safety: double-checked with {@link #computedIdIndex} volatile. The build holds the
+         * vector store's own monitor — a leaf lock independent of the parent GigaMap monitor and
+         * {@code builderLock}, so triggering it from a search (under {@code builderLock.readLock}) or a
+         * mutation (under the parent monitor) cannot deadlock. Mutations route their store lookups
+         * through this accessor too, so the map is present before any {@code put}/{@code get}.
+         */
+        private Map<Long, Long> computedIdIndex()
+        {
+            if(this.isEmbedded() || this.vectorStore == null)
+            {
+                return null;
+            }
+            Map<Long, Long> idx = this.computedIdIndex;
+            if(idx == null)
+            {
+                synchronized(this.vectorStore)
+                {
+                    idx = this.computedIdIndex;
+                    if(idx == null)
+                    {
+                        this.computedIdIndex = idx = this.buildComputedIdIndex();
+                    }
+                }
+            }
+            return idx;
+        }
+
+        /**
+         * Builds the {@code sourceEntityId -> storeId} map, from the vector store's
+         * {@code sourceEntityId} identity index where possible
+         * ({@link #buildComputedIdIndexFromIndex()}), else by a positional store scan
+         * ({@link #buildComputedIdIndexByScan()}) during the {@code complete()} deserialization
+         * window, when the index registry is not yet queryable. Both paths yield the same map.
+         */
+        private Map<Long, Long> buildComputedIdIndex()
+        {
+            final Map<Long, Long> fromIndex = this.buildComputedIdIndexFromIndex();
+            return fromIndex != null
+                ? fromIndex
+                : this.buildComputedIdIndexByScan()
+            ;
+        }
+
+        /**
+         * The preferred {@link #buildComputedIdIndex()} path: reconstructs the map from the vector
+         * store's {@code sourceEntityId} identity index bitmaps, loading no {@code VectorEntry} and
+         * therefore no stored vectors. Returns {@code null} when that index is not queryable yet, in
+         * which case the caller falls back to {@link #buildComputedIdIndexByScan()}.
+         * <p>
+         * Package-private for {@code VectorIndexIdDriftTest}, which asserts both paths agree.
+         */
+        Map<Long, Long> buildComputedIdIndexFromIndex()
+        {
+            final BitmapIndex<VectorEntry, Long> idIndex = this.vectorStore.index().bitmap()
+                .get(Long.class, VectorEntry.SOURCE_ENTITY_ID_INDEXER.name());
+            if(idIndex == null)
+            {
+                return null;
+            }
+
+            final Map<Long, Long> index = new ConcurrentHashMap<>();
+            // (key = sourceEntityId, entityId = storeId) — no value loaded.
+            idIndex.iterateKeyEntityPairs((sourceEntityId, storeId) -> index.put(sourceEntityId, storeId));
+            return index;
+        }
+
+        /**
+         * The {@link #buildComputedIdIndex()} fallback: a positional store scan, reading
+         * {@link VectorEntry#sourceEntityId} off each entry. Only reached by a non-incremental graph
+         * rebuild, which loads every vector anyway, so its value pass is not an added cost.
+         * <p>
+         * Package-private for {@code VectorIndexIdDriftTest}, which asserts both paths agree.
+         */
+        Map<Long, Long> buildComputedIdIndexByScan()
+        {
+            final Map<Long, Long> index = new ConcurrentHashMap<>();
+            this.vectorStore.iterateIndexed((storeId, entry) -> index.put(entry.sourceEntityId, storeId));
+            return index;
+        }
+
+        /**
+         * Resolves the raw vector for a graph ordinal (source entity id) in computed mode via the
+         * {@link #computedIdIndex} and a direct, lazy {@code vectorStore.get(internalId)} — no index
+         * query on the hot scoring path. Returns {@code null} if the entity has no stored vector.
+         */
+        private float[] lookupComputedVector(final int ordinal)
+        {
+            final Map<Long, Long> index = this.computedIdIndex();
+            final Long storeId = index == null ? null : index.get((long)ordinal);
+            if(storeId == null)
+            {
+                return null;
+            }
+            final VectorEntry entry = this.vectorStore.get(storeId);
+            return entry == null ? null : entry.vector;
+        }
+
+        private List<VectorEntry> collectStoredVectors()
+        {
+            final List<VectorEntry> entries = new ArrayList<>();
+
+            if(this.isEmbedded())
+            {
+                this.parentMap().iterateIndexed((entityId, entity) ->
+                {
+                    final float[] vector = this.vectorize(entity);
+                    // Entities without an embedding (opted-in null vectors) are not graph nodes.
+                    if(vector != null)
+                    {
+                        entries.add(new VectorEntry(entityId, vector));
+                    }
+                });
+            }
+            else
+            {
+                // Computed mode: rebuild from vector store. Null-vector entries are never
+                // stored, but keep a defensive filter in case of legacy data.
+                if(this.vectorStore != null && !this.vectorStore.isEmpty())
+                {
+                    this.vectorStore.iterate(entry ->
+                    {
+                        if(entry.vector != null)
+                        {
+                            entries.add(entry);
+                        }
+                    });
+                }
+            }
+
+            return entries;
+        }
+
+        private void initializeIndex()
+        {
+            this.vectorTypeSupport = VectorizationProvider.getInstance().getVectorTypeSupport();
+
+            // Initialize builder lock (always, for consistent locking semantics)
+            if(this.builderLock == null)
+            {
+                this.builderLock = new ReentrantReadWriteLock();
+            }
+            if(this.deferredBuilderOps == null)
+            {
+                this.deferredBuilderOps = new ConcurrentLinkedQueue<>();
+            }
+
+            // Reset the computed-mode fast lookup index; it is (re)built lazily on first access
+            // (see computedIdIndex()). Clearing here covers reinitialization after internalRemoveAll,
+            // where a stale map would otherwise survive. A non-incremental graph rebuild that follows
+            // triggers the lazy build itself via lookupComputedVector() during node scoring.
+            this.computedIdIndex = null;
+
+            // Initialize PQ manager if compression enabled
+            if(this.configuration.enablePqCompression())
+            {
+                this.pqManager = new PQCompressionManager.Default(
+                    this,
+                    this.name,
+                    this.configuration.dimension(),
+                    this.configuration.pqSubspaces()
+                );
+            }
+
+            // Initialize in-memory builder
+            this.initializeInMemoryBuilder();
+
+            // Try to load from disk if on-disk mode is enabled
+            if(this.configuration.onDisk())
+            {
+                this.diskManager = new DiskIndexManager.Default(
+                    this,
+                    this.name,
+                    this.configuration.indexDirectory(),
+                    this.configuration.dimension(),
+                    this.configuration.maxDegree(),
+                    this.configuration.parallelOnDiskWrite()
+                );
+                if(this.diskManager.tryLoad())
+                {
+                    // Mark PQ as trained if compression was enabled (FusedPQ is embedded)
+                    if(this.pqManager != null)
+                    {
+                        this.pqManager.markTrained();
+                        LOG.debug("FusedPQ compression loaded from disk for '{}'", this.name);
+                    }
+
+                    // Enter incremental on-disk mode: disk index serves search,
+                    // in-memory builder only handles new mutations.
+                    // Set state fields first, then flip incrementalMode last for safe publication.
+                    this.diskDeletedOrdinals = ConcurrentHashMap.newKeySet();
+                    this.incrementalMode     = true;
+                    LOG.info("Entering incremental on-disk mode for '{}' — skipping full graph rebuild", this.name);
+                }
+                else
+                {
+                    LOG.info("Could not load disk index for '{}', will build in-memory and persist later", this.name);
+                }
+            }
+
+            // Initialize searcher pool
+            this.initializeSearcherPool();
+
+            // Start background managers if enabled
+            this.startBackgroundManagersIfEnabled();
+        }
+
+        /**
+         * Starts the unified background task manager if any background feature is enabled.
+         */
+        private void startBackgroundManagersIfEnabled()
+        {
+            final boolean eventualIndexing       = this.configuration.eventualIndexing();
+            final boolean backgroundOptimization = this.configuration.backgroundOptimization();
+            final boolean backgroundPersistence  = this.configuration.onDisk() && this.configuration.backgroundPersistence();
+
+            if(eventualIndexing || backgroundOptimization || backgroundPersistence)
+            {
+                if(this.backgroundTaskManager == null)
+                {
+                    this.backgroundTaskManager = new BackgroundTaskManager(
+                        this,
+                        this.name,
+                        eventualIndexing,
+                        backgroundOptimization,
+                        this.configuration.optimizationIntervalMs(),
+                        this.configuration.minChangesBetweenOptimizations(),
+                        backgroundPersistence,
+                        this.configuration.persistenceIntervalMs(),
+                        this.configuration.minChangesBetweenPersists(),
+                        this.configuration.shutdownPersistTimeoutMillis()
+                    );
+                }
+            }
+        }
+
+        /**
+         * Returns whether eventual indexing is active (background task manager exists
+         * AND eventualIndexing is configured). The manager may exist for optimization
+         * or persistence alone.
+         */
+        private boolean isEventualIndexing()
+        {
+            return this.backgroundTaskManager != null && this.configuration.eventualIndexing();
+        }
+
+        /**
+         * Initializes the in-memory graph builder.
+         */
+        private void initializeInMemoryBuilder()
+        {
+            final RandomAccessVectorValues vectorValues = new NullSafeVectorValues(
+                this.createVectorValues(), this.configuration.dimension(), this.vectorTypeSupport
+            );
+            final BuildScoreProvider scoreProvider = BuildScoreProvider.randomAccessScoreProvider(
+                vectorValues,
+                this.jvectorSimilarityFunction()
+            );
+
+            this.builder = new GraphIndexBuilder(
+                scoreProvider,
+                this.configuration.dimension(),
+                this.configuration.maxDegree(),
+                this.configuration.beamWidth(),
+                this.configuration.neighborOverflow(),
+                this.configuration.alpha(),
+                true // use hierarchical index
+            );
+            this.index = (OnHeapGraphIndex)this.builder.getGraph();
+        }
+
+        /**
+         * Initializes the thread-local searcher pool.
+         */
+        private void initializeSearcherPool()
+        {
+            // Close existing pools if present
+            this.closeSearcherPools();
+
+            final boolean diskLoaded = this.diskManager != null && this.diskManager.isLoaded();
+
+            if(this.incrementalMode && diskLoaded && this.diskManager.getDiskIndex() != null)
+            {
+                // Incremental mode: two pools — disk searcher for existing data,
+                // in-memory searcher for newly added data
+                final var diskIndex = this.diskManager.getDiskIndex();
+                this.diskSearcherPool = ExplicitThreadLocal.withInitial(() ->
+                {
+                    try
+                    {
+                        return new GraphSearcher(diskIndex);
+                    }
+                    catch(final Exception e)
+                    {
+                        throw new RuntimeException("Failed to create GraphSearcher for disk index", e);
+                    }
+                });
+
+                // In-memory pool for the builder's graph (new mutations)
+                if(this.index != null)
+                {
+                    this.inMemorySearcherPool = ExplicitThreadLocal.withInitial(() ->
+                    {
+                        try
+                        {
+                            return new GraphSearcher(this.index);
+                        }
+                        catch(final Exception e)
+                        {
+                            throw new RuntimeException("Failed to create GraphSearcher for in-memory index", e);
+                        }
+                    });
+                }
+            }
+            else if(diskLoaded && this.diskManager.getDiskIndex() != null)
+            {
+                // Non-incremental disk mode: single pool for disk index
+                final var diskIndex = this.diskManager.getDiskIndex();
+                this.inMemorySearcherPool = ExplicitThreadLocal.withInitial(() ->
+                {
+                    try
+                    {
+                        return new GraphSearcher(diskIndex);
+                    }
+                    catch(final Exception e)
+                    {
+                        throw new RuntimeException("Failed to create GraphSearcher for disk index", e);
+                    }
+                });
+            }
+            else if(this.index != null)
+            {
+                // In-memory only pool
+                this.inMemorySearcherPool = ExplicitThreadLocal.withInitial(() ->
+                {
+                    try
+                    {
+                        return new GraphSearcher(this.index);
+                    }
+                    catch(final Exception e)
+                    {
+                        throw new RuntimeException("Failed to create GraphSearcher for in-memory index", e);
+                    }
+                });
+            }
+        }
+
+        /**
+         * Closes the searcher pools and releases resources.
+         */
+        private void closeSearcherPools()
+        {
+            if(this.diskSearcherPool != null)
+            {
+                try
+                {
+                    this.diskSearcherPool.close();
+                }
+                catch(final Exception e)
+                {
+                    LOG.warn("Error closing disk searcher pool: {}", e.getMessage());
+                }
+                this.diskSearcherPool = null;
+            }
+
+            if(this.inMemorySearcherPool != null)
+            {
+                try
+                {
+                    this.inMemorySearcherPool.close();
+                }
+                catch(final Exception e)
+                {
+                    LOG.warn("Error closing searcher pool: {}", e.getMessage());
+                }
+                this.inMemorySearcherPool = null;
+            }
+        }
+
+
+        ///////////////////////////////////////////////////////////////////////////
+        // methods //
+        ////////////
+
+        private static int toOrdinal(final long entityId)
+        {
+            if(entityId > Integer.MAX_VALUE)
+            {
+                throw new IllegalStateException(
+                    "Entity ID " + entityId + " exceeds maximum supported value of " + Integer.MAX_VALUE
+                );
+            }
+            return (int)entityId;
+        }
+
+        private float[] vectorize(final E entity)
+        {
+            return this.validateVector(this.vectorizer.vectorize(entity));
+        }
+
+        private List<float[]> vectorize(final List<? extends E> entities)
+        {
+            final List<float[]> vectors = this.vectorizer.vectorizeAll(entities);
+
+            if(vectors == null)
+            {
+                throw new IllegalStateException(
+                    "vectorizeAll returned null in index \"%s\" (vectorizer: %s)"
+                        .formatted(this.name(), this.vectorizer.getClass().getName())
+                );
+            }
+
+            if(vectors.size() != entities.size())
+            {
+                throw new IllegalStateException(
+                    "vectorizeAll returned %d vectors for %d entities in index \"%s\" (vectorizer: %s)"
+                        .formatted(vectors.size(), entities.size(), this.name(), this.vectorizer.getClass().getName())
+                );
+            }
+
+            vectors.forEach(this::validateVector);
+            return vectors;
+        }
+
+        private float[] validateVector(final float[] vector)
+        {
+            if(vector == null)
+            {
+                // Null means "this entity has no embedding" when the vectorizer opts in;
+                // it is then excluded from the graph. Otherwise fail fast.
+                if(this.vectorizer.allowsNullVectors())
+                {
+                    return null;
+                }
+                throw new IllegalStateException(
+                    "Null vector returned from vectorizer in index \"" + this.name()
+                        + "\" (vectorizer: " + this.vectorizer.getClass().getName() + "). "
+                        + "Override Vectorizer.allowsNullVectors() to permit entities without embeddings."
+                );
+            }
+
+            this.validateDimension(vector);
+
+            return vector;
+        }
+
+        private void validateDimension(final float[] vector)
+        {
+            final int expectedDim = this.configuration.dimension();
+            if(vector.length != expectedDim)
+            {
+                throw new IllegalStateException(
+                    "Vector must have dimension " + expectedDim + ", got " + vector.length
+                );
+            }
+        }
+
+        private boolean isEmbedded()
+        {
+            return this.vectorizer.isEmbedded();
+        }
+
+        @Override
+        public final GigaMap<E> parentMap()
+        {
+            return this.parent.parentMap();
+        }
+
+        /**
+         * Records a graph-affecting content change: bumps the persisted {@link #structuralModCount}
+         * (the crash-restart witness stamped into the disk {@code .meta}) and marks the index dirty
+         * for the next persist. Use in place of {@link #markStateChangeChildren()} at content
+         * mutation sites (add / remove / vec↔null transition); do NOT use it for {@code optimize()},
+         * which reshapes the graph without changing logical content and must not force a rebuild.
+         * <p>
+         * Marks BOTH the instance and children dirty: {@code structuralModCount} is a field of this
+         * instance, so it is only re-serialized when the instance itself is flagged
+         * AbstractStateChangeFlagged#isInstanceNewOrChanged() gates {@code internalStore}) —
+         * {@code markStateChangeChildren()} alone would persist only children (e.g. the computed-mode
+         * {@code vectorStore}) and silently drop the counter.
+         */
+        private void markContentChanged()
+        {
+            this.structuralModCount++;
+            this.markStateChangeInstance();
+            this.markStateChangeChildren();
+        }
+
+        @Override
+        public VectorIndices<E> parent()
+        {
+            return this.parent;
+        }
+
+        @Override
+        public String name()
+        {
+            return this.name;
+        }
+
+        @Override
+        public Vectorizer<? super E> vectorizer()
+        {
+            return this.vectorizer;
+        }
+
+        @Override
+        public VectorIndexConfiguration configuration()
+        {
+            return this.configuration;
+        }
+
+        private io.github.jbellis.jvector.vector.VectorSimilarityFunction jvectorSimilarityFunction()
+        {
+            // use switch not valueOf(name) to ensure compiler assistance when jvector enum changes
+            return switch(this.configuration.similarityFunction())
+            {
+                case EUCLIDEAN   -> io.github.jbellis.jvector.vector.VectorSimilarityFunction.EUCLIDEAN;
+                case DOT_PRODUCT -> io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
+                case COSINE      -> io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE;
+            };
+        }
+
+        @Override
+        public void internalAdd(final long entityId, final E entity)
+        {
+            // No synchronized(parentMap) needed — called from GigaMap's synchronized methods.
+            final int ordinal = toOrdinal(entityId);
+
+            this.ensureIndexInitialized();
+
+            final float[] vector = this.vectorize(entity);
+
+            // Null vector (opted-in): the entity has no embedding — keep it out of the vector
+            // store and the graph entirely, so it never appears in search results.
+            if(vector == null)
+            {
+                return;
+            }
+
+            final VectorEntry vectorEntry = new VectorEntry(entityId, vector);
+
+            // Store based on vectorizer type
+            if(!this.isEmbedded())
+            {
+                final long storeId = this.vectorStore.add(vectorEntry);
+                this.computedIdIndex().put(entityId, storeId);
+            }
+
+            this.markContentChanged();
+
+            if(this.isEventualIndexing())
+            {
+                // Defer graph update to background thread
+                this.backgroundTaskManager.enqueueAdd(vectorEntry);
+            }
+            else
+            {
+                // Drain any deferred builder ops before adding a new graph node.
+                if(!this.cleanupInProgress)
+                {
+                    this.drainDeferredBuilderOps();
+                }
+
+                // Add to HNSW graph using entity ID as ordinal. Idempotent: a deferred op may be
+                // drained into a builder that already carries the ordinal (internal #142).
+                final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(vector);
+                this.executeOrDeferBuilderOp(() -> this.internalAddGraphNodeIdempotent(ordinal, vf));
+
+                // Mark dirty for background managers
+                this.markDirtyForBackgroundManagers(1);
+            }
+        }
+
+        @Override
+        public void internalAddAll(final long firstEntityId, final Iterable<? extends E> entities)
+        {
+            // Collect vectors first (outside of main synchronized block)
+            final List<VectorEntry> entries = this.collectVectors(firstEntityId, entities);
+
+            if(!entries.isEmpty())
+            {
+                this.addVectorEntries(entries);
+            }
+        }
+
+        @Override
+        public void internalUpdate(final long entityId, final E replacedEntity, final E entity)
+        {
+            // No synchronized(parentMap) needed — called from GigaMap's synchronized methods.
+            this.ensureIndexInitialized();
+
+            final float[]  vector   = this.vectorize(entity);
+            final int      ordinal  = toOrdinal(entityId);
+            final boolean  embedded = this.isEmbedded();
+
+            // Update the computed-mode vector store to reflect the new (possibly absent) vector.
+            // Keyed by source entity id (not positionally), so the four vec/null transitions map
+            // cleanly onto add / replace / remove.
+            boolean changed         = false;
+            boolean vectorUnchanged = false;
+            if(!embedded)
+            {
+                // Resolve the store-internal id by source entity id via the fast index, then
+                // mutate via id-based ops (set / removeById / add), keeping the index in sync.
+                final Map<Long, Long> computedIdIndex = this.computedIdIndex();
+                final Long storeId = computedIdIndex.get(entityId);
+                if(vector == null)
+                {
+                    // vec→null: drop the stored entry so the entity is no longer indexed.
+                    // null→null: nothing stored, nothing to do.
+                    if(storeId != null)
+                    {
+                        this.vectorStore.removeById(storeId);
+                        computedIdIndex.remove(entityId);
+                        changed = true;
+                    }
+                }
+                else if(storeId != null)
+                {
+                    // vec→vec (store-internal id unchanged). An update whose vector did not actually
+                    // change is a no-op for this index: unlike the embedded case there is no live
+                    // re-scoring from the entity, the stored vector IS the indexed value. Detect it
+                    // with one lazy store read and skip the store write, the graph repair
+                    // (markNodeDeleted + removeDeletedNodes + addGraphNode, two ForkJoinPool round
+                    // trips per level) and all the change bookkeeping. Callers that touch unrelated
+                    // entity fields (an adjacency list, say) would otherwise pay full graph repair
+                    // per update (internal #142), which is also what floods the deferred op queue.
+                    final VectorEntry existing = this.vectorStore.get(storeId);
+                    if(existing != null && Arrays.equals(existing.vector, vector))
+                    {
+                        vectorUnchanged = true;
+                    }
+                    else
+                    {
+                        this.vectorStore.set(storeId, new VectorEntry(entityId, vector));
+                        changed = true;
+                    }
+                }
+                else
+                {
+                    // null→vec: the entity gains an embedding.
+                    final long newStoreId = this.vectorStore.add(new VectorEntry(entityId, vector));
+                    computedIdIndex.put(entityId, newStoreId);
+                    changed = true;
+                }
+            }
+
+            // Persisted structural-change witness: driven by the logical (id→vector) transition,
+            // NOT the in-memory graph op below. In incremental mode an embedded vec→null removes a
+            // disk-resident node the in-memory builder never held, so the graph-op flag would miss
+            // it (and the crash-restart rebuild would not trigger); classify embedded transitions
+            // from the old vector instead. Computed mode's store block above already set `changed`
+            // precisely (the four transitions map onto add / set / remove / no-op).
+            final boolean contentChanged;
+            if(embedded)
+            {
+                // A non-null new vector is always a change (null→vec or vec→vec). Only a null new vector
+                // needs the old vector — to tell vec→null (a change) from null→null (the only no-op) —
+                // so re-vectorize replacedEntity solely on that path, not on the common non-null update.
+                contentChanged = vector != null
+                    || (replacedEntity != null && this.vectorize(replacedEntity) != null);
+            }
+            else
+            {
+                contentChanged = changed;
+            }
+
+            // In incremental mode, mark the ordinal as deleted from disk graph so disk search excludes
+            // the stale version immediately, regardless of whether indexing is synchronous or eventual.
+            // Gated on contentChanged: a null→null no-op has no stale disk version to exclude, and
+            // adding it would only bloat diskDeletedOrdinals and enlarge the boolean[maxOrdinal+1] mask
+            // rebuilt in createDiskAcceptBits() on every search.
+            if(contentChanged && this.incrementalMode && this.diskDeletedOrdinals != null)
+            {
+                this.diskDeletedOrdinals.add(ordinal);
+            }
+
+            if(this.isEventualIndexing())
+            {
+                // Only a real (id→vector) transition needs background graph work. null→null is a no-op
+                // in both modes; contentChanged is the reliable synchronous witness (for embedded it is
+                // derived from the old vector above, so — unlike the raw graph-op flag — it is not racy
+                // against queued mutations). applyGraphUpdate then derives the actual transition
+                // (add / delete / delete+re-add) from the enqueued entry's vector nullness.
+                if(contentChanged)
+                {
+                    this.backgroundTaskManager.enqueueUpdate(new VectorEntry(entityId, vector));
+                }
+            }
+            else
+            {
+                // Drain any deferred builder ops (e.g. from a preceding addAll()) before
+                // modifying graph nodes. This avoids interleaving batch-add ops with
+                // delete+re-add ops, which can corrupt HNSW neighbor lists.
+                if(!this.cleanupInProgress)
+                {
+                    this.drainDeferredBuilderOps();
+                }
+
+                // Classify against ONE builder read, derived graph included: two separate reads of
+                // the volatile fields can straddle a persist's builder swap and answer from
+                // different graphs.
+                final GraphIndexBuilder currentBuilder = this.builder;
+                final OnHeapGraphIndex  currentGraph   = currentBuilder == null ? null : graphOf(currentBuilder);
+                final boolean           inGraph        = currentGraph != null && currentGraph.containsNode(ordinal);
+
+                if(vector == null)
+                {
+                    // vec→null / null→null: remove the node from the in-memory graph if present.
+                    // No removeDeletedNodes() — unnecessary (markNodeDeleted already excludes it
+                    // from liveNodes), and its ForkJoinPool would deadlock with the GigaMap
+                    // monitor we hold for embedded vectorizers.
+                    // Route through internalMarkOrdinalDeleted so a deferral drained after a persist
+                    // builder swap still records the deletion (via diskDeletedOrdinals) instead of
+                    // no-op'ing against the new empty builder. The pre-deferral inGraph check is no
+                    // longer sufficient on its own: in incremental mode a disk-only node is not in
+                    // the in-memory graph, so gating on it alone would queue nothing and the eager
+                    // diskDeletedOrdinals entry made above is wiped by the persist's mode swap,
+                    // leaving the stale disk node visible to search (internal #142). contentChanged
+                    // covers that case; inGraph is kept as well so a transition this method cannot
+                    // classify (a null replacedEntity) still clears the node it can see.
+                    if(contentChanged || inGraph)
+                    {
+                        this.executeOrDeferBuilderOp(() -> this.internalMarkOrdinalDeleted(ordinal));
+                        changed = true;
+                    }
+                }
+                else if(embedded)
+                {
+                    // Three distinct embedded, non-null transitions, distinguished by graph state.
+                    // Note containsNode() alone is NOT enough: jvector's markNodeDeleted() only sets
+                    // a deleted bit and leaves the node in layer 0, so containsNode() stays true for
+                    // a marked-deleted node. A prior vec→null in this same session (without an
+                    // intervening optimize) leaves the node present-but-deleted, which is a third
+                    // case the plain !inGraph guard would silently mis-handle.
+                    //
+                    // The classification below only selects WHICH op to enqueue; each op re-derives
+                    // the graph state itself when it runs, because a deferred op can be drained into
+                    // a builder that was swapped in the meantime (internal #142).
+                    if(!inGraph)
+                    {
+                        // null→vec: the node was never added (or a prior optimize physically removed
+                        // it) — add it now. addGraphNode alone is monitor-safe (no removeDeletedNodes),
+                        // the same call internalAdd makes.
+                        final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(vector);
+                        this.executeOrDeferBuilderOp(() -> this.internalReaddGraphNode(ordinal, vf));
+                    }
+                    else if(currentGraph.getDeletedNodes().get(ordinal))
+                    {
+                        // vec→null→vec on the SAME entity: the node is still present but marked
+                        // deleted. Resurrect it by clearing the deleted bit — monitor-safe (no
+                        // ForkJoinPool), unlike removeDeletedNodes()+addGraphNode, whose workers
+                        // call parentMap.get() and would deadlock with the GigaMap monitor we hold.
+                        // The node keeps its (now stale) neighbor links and search re-scores it live
+                        // from the entity via EntityBackedVectorValues — identical to the vec→vec
+                        // "leave as-is" contract below; the next optimize/persist rebuilds connections.
+                        // Without this, the entity would stay excluded from liveNodes() forever.
+                        final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(vector);
+                        this.executeOrDeferBuilderOp(() -> this.internalResurrectGraphNode(ordinal, vf));
+                    }
+                    // else vec→vec: leave the graph as-is — removeDeletedNodes() uses a ForkJoinPool
+                    // whose workers call parentMap.get(), deadlocking with the GigaMap monitor we
+                    // hold. The updated entity is already in the GigaMap, so EntityBackedVectorValues
+                    // returns the new vector during search, and the next optimize/persist cycle
+                    // rebuilds the graph connections.
+                    changed = true;
+                }
+                else if(!vectorUnchanged)
+                {
+                    // Computed, non-null and actually different (vec→vec' or null→vec): vectors are
+                    // stored separately, so removeDeletedNodes() won't call parentMap.get().
+                    // Safe to inline.
+                    final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(vector);
+                    this.executeOrDeferBuilderOp(() -> this.internalReplaceGraphNode(ordinal, vf));
+                    changed = true;
+                }
+
+                if(changed)
+                {
+                    this.markDirtyForBackgroundManagers(1);
+                }
+            }
+
+            // Bump the persisted structural-change counter + mark the index dirty whenever the
+            // logical mapping changed — independent of whether an in-memory graph op ran, so an
+            // incremental-mode disk-node deletion (embedded vec→null) is still recorded and forces
+            // a crash-restart rebuild. null→null is the only case that skips this.
+            if(contentChanged)
+            {
+                this.markContentChanged();
+            }
+        }
+
+        /**
+         * Collects and validates vectors from entities.
+         */
+        private List<VectorEntry> collectVectors(final long firstEntityId, final Iterable<? extends E> entities)
+        {
+            final List<float[]> vectors = this.vectorize(this.toList(entities));
+            return IntStream.range(0, vectors.size())
+                .mapToObj(i -> new VectorEntry(firstEntityId + i, vectors.get(i)))
+                .toList()
+            ;
+        }
+
+        private List<? extends E> toList(final Iterable<? extends E> entities)
+        {
+            if(entities instanceof final List<? extends E> list)
+            {
+                return list;
+            }
+            if(entities instanceof final Collection<? extends E> collection)
+            {
+                return new ArrayList<>(collection);
+            }
+            final List<E> list = new ArrayList<>();
+            entities.forEach(list::add);
+            return list;
+        }
+
+        /**
+         * Adds vector entries to the index.
+         */
+        private void addVectorEntries(final List<VectorEntry> entriesIncludingNulls)
+        {
+            // No synchronized(parentMap) needed — called from GigaMap's synchronized methods.
+            this.ensureIndexInitialized();
+
+            // Drop entries without a vector (opted-in null embeddings): they get neither a
+            // vector store entry nor a graph node, so they never appear in search results.
+            // The kept entries carry their own sourceEntityId, so filtering does not disturb
+            // id alignment.
+            final List<VectorEntry> entries = entriesIncludingNulls.stream()
+                .filter(e -> e.vector != null)
+                .toList()
+            ;
+
+            if(entries.isEmpty())
+            {
+                return;
+            }
+
+            if(!this.isEmbedded())
+            {
+                // Add individually to capture each store-internal id for the fast index; robust
+                // against hole reuse (a batch addAll only reports the last assigned id).
+                final Map<Long, Long> computedIdIndex = this.computedIdIndex();
+                for(final VectorEntry entry : entries)
+                {
+                    final long storeId = this.vectorStore.add(entry);
+                    computedIdIndex.put(entry.sourceEntityId, storeId);
+                }
+            }
+
+            this.markContentChanged();
+
+            if(this.isEventualIndexing())
+            {
+                // Defer graph updates to background thread as a single batch operation
+                this.backgroundTaskManager.enqueueBatchAdd(entries);
+            }
+            else
+            {
+                // Drain any deferred builder ops (e.g. from a preceding set() or removeById())
+                // before adding new nodes. This avoids interleaving delete+re-add ops from
+                // set/remove with batch-add ops, which can corrupt HNSW neighbor lists.
+                // Safe to drain here because we hold the GigaMap monitor and cleanup is not
+                // in progress (if it were, executeOrDeferBuilderOp below would defer anyway).
+                if(!this.cleanupInProgress)
+                {
+                    this.drainDeferredBuilderOps();
+                }
+
+                this.executeOrDeferBuilderOp(() -> this.addGraphNodesSequential(entries));
+
+                // Mark dirty for background managers (with count for debouncing)
+                this.markDirtyForBackgroundManagers(entries.size());
+            }
+        }
+
+        /**
+         * Marks dirty for background managers with the specified change count.
+         */
+        @Override
+        public void markDirtyForBackgroundManagers(final int count)
+        {
+            if(this.backgroundTaskManager != null)
+            {
+                this.backgroundTaskManager.markDirty(count);
+            }
+        }
+
+        /**
+         * Adds graph nodes sequentially.
+         */
+        private void addGraphNodesSequential(final List<VectorEntry> entries)
+        {
+            entries.forEach(entry ->
+            {
+                if(entry.vector == null)
+                {
+                    // Entities without an embedding are excluded from the graph.
+                    return;
+                }
+                final int ordinal = toOrdinal(entry.sourceEntityId);
+                final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(entry.vector);
+                this.internalAddGraphNodeIdempotent(ordinal, vf);
+            });
+        }
+
+        @Override
+        public void internalRemove(final long entityId, final E entity)
+        {
+            // No synchronized(parentMap) needed — called from GigaMap's synchronized methods.
+            this.ensureIndexInitialized();
+
+            final int ordinal = toOrdinal(entityId);
+            if(!this.isEmbedded())
+            {
+                // Resolve by source entity id via the fast index; a never-indexed entity
+                // (null embedding) simply has no entry and nothing is removed.
+                final Map<Long, Long> computedIdIndex = this.computedIdIndex();
+                final Long storeId = computedIdIndex.get(entityId);
+                if(storeId != null)
+                {
+                    this.vectorStore.removeById(storeId);
+                    computedIdIndex.remove(entityId);
+                }
+            }
+
+            this.markContentChanged();
+
+            // In incremental mode, mark the ordinal as deleted from disk graph
+            // so disk search excludes it immediately, even before background
+            // processing has updated the on-disk graph.
+            if(this.incrementalMode && this.diskDeletedOrdinals != null)
+            {
+                this.diskDeletedOrdinals.add(ordinal);
+            }
+
+            if(this.isEventualIndexing())
+            {
+                // Defer graph update to background thread
+                this.backgroundTaskManager.enqueueRemove(ordinal);
+            }
+            else
+            {
+                // Drain any deferred builder ops before modifying graph nodes.
+                if(!this.cleanupInProgress)
+                {
+                    this.drainDeferredBuilderOps();
+                }
+
+                // Mark deleted in the in-memory builder if the node exists there
+                // (e.g., added after disk reload). Disk-only nodes are excluded
+                // via diskDeletedOrdinals and won't be in the builder. Route through
+                // internalMarkOrdinalDeleted so a deferral drained after a persist builder swap
+                // still records the deletion instead of no-op'ing against the new empty builder.
+                // Enqueued unconditionally: the helper checks the builder itself when it runs, and
+                // gating here on the CURRENT builder would queue nothing for a disk-only node, whose
+                // eager diskDeletedOrdinals entry above is then wiped by a concurrent persist's mode
+                // swap, resurrecting the removed entity in search (internal #142).
+                this.executeOrDeferBuilderOp(() -> this.internalMarkOrdinalDeleted(ordinal));
+
+                // Mark dirty for background managers
+                this.markDirtyForBackgroundManagers(1);
+            }
+        }
+
+        @Override
+        public void internalRemoveAll()
+        {
+            // Acquire write lock to ensure no concurrent persistToDisk() Phase 2,
+            // search, or background worker mutation is running.
+            // closeInternalResources() destroys the graph and disk manager, which would
+            // corrupt any in-flight operation.
+            // No synchronized(parentMap) needed — called from GigaMap's synchronized methods.
+            this.builderLock.writeLock().lock();
+            try
+            {
+                this.ensureIndexInitialized();
+
+                if(!this.isEmbedded())
+                {
+                    this.vectorStore.removeAll();
+                }
+
+                // Reset incremental state before closing resources
+                this.incrementalMode = false;
+                if(this.diskDeletedOrdinals != null)
+                {
+                    this.diskDeletedOrdinals.clear();
+                    this.diskDeletedOrdinals = null;
+                }
+
+                // Shutdown background task manager (discard pending ops — they're stale)
+                this.shutdownBackgroundTaskManager(false, false, false);
+
+                // Same for deferred sync-mode ops: the graph they describe is about to be destroyed,
+                // so replaying them into the fresh builder would resurrect removed entities.
+                if(this.deferredBuilderOps != null)
+                {
+                    this.deferredBuilderOps.clear();
+                }
+
+                this.closeInternalResources();
+
+                // Reinitialize the index (this will also restart background managers if configured)
+                this.initializeIndex();
+                this.markContentChanged();
+
+                // Mark dirty for background managers
+                this.markDirtyForBackgroundManagers(1);
+            }
+            finally
+            {
+                this.builderLock.writeLock().unlock();
+            }
+        }
+
+        @Override
+        public float[] getVector(final long entityId)
+        {
+            if(this.isEmbedded())
+            {
+                final E entity = this.parentMap().get(entityId);
+                if(entity == null)
+                {
+                    return null;
+                }
+                return this.vectorizer.vectorize(entity);
+            }
+
+            // Resolve via the fast source-id index (built lazily on first access); fall back to a
+            // direct identity-index query only in the defensive case where it is unavailable.
+            final Map<Long, Long> idIndex = this.computedIdIndex();
+            final VectorEntry entry;
+            if(idIndex != null)
+            {
+                final Long storeId = idIndex.get(entityId);
+                entry = storeId == null ? null : this.vectorStore.get(storeId);
+            }
+            else
+            {
+                entry = VectorEntry.lookup(this.vectorStore, entityId);
+            }
+            if(entry == null)
+            {
+                return null;
+            }
+            return entry.vector;
+        }
+
+        @Override
+        public VectorSearchResult<E> search(final float[] queryVector, final int k)
+        {
+            return this.doSearch(queryVector, k, this.computeRerankK(k));
+        }
+
+        @Override
+        public VectorSearchResult<E> search(final float[] queryVector, final int k, final int searchBeamWidth)
+        {
+            return this.doSearch(queryVector, k, Math.max(k, positive(searchBeamWidth)));
+        }
+
+        private VectorSearchResult<E> doSearch(final float[] queryVector, final int k, final int rerankK)
+        {
+            if(queryVector == null)
+            {
+                throw new IllegalArgumentException("Query vector must not be null");
+            }
+            // Enforce the documented k > 0 precondition here, the single funnel for every search
+            // overload (float[] and entity-based, with and without an explicit beam width), rather
+            // than letting a non-positive topK reach jvector's searcher.
+            if(k <= 0)
+            {
+                throw new IllegalArgumentException("k must be positive: " + k);
+            }
+            this.validateDimension(queryVector);
+
+            // Ensure the (deferred) graph rebuild has run BEFORE acquiring the read lock: the
+            // rebuild gate takes the parent GigaMap monitor, and holding readLock while acquiring
+            // that monitor would risk the exact lock-ordering deadlock the read-lock note below
+            // warns about. Once rebuilt this is a lock-free volatile check.
+            this.ensureIndexInitialized();
+
+            // Acquire read lock — blocks during cleanup/persistence/removeAll/close,
+            // allows concurrent searches and GigaMap mutations.
+            // No synchronized(parentMap) — avoids lock-ordering deadlock with
+            // internalRemoveAll (which holds the GigaMap monitor and needs the write lock).
+            this.builderLock.readLock().lock();
+            try
+            {
+                final VectorFloat<?> query = this.vectorTypeSupport.createFloatVector(queryVector);
+
+                // Choose search strategy based on index mode
+                final SearchResult result;
+                if (this.incrementalMode)
+                {
+                    result = this.searchIncremental(query, k, rerankK);
+                }
+                else if (this.diskManager != null && this.diskManager.isLoaded() && this.diskManager.getDiskIndex() != null)
+                {
+                    result = this.searchDiskIndex(query, k, rerankK);
+                }
+                else
+                {
+                    result = this.searchInMemoryIndex(query, k, rerankK);
+                }
+
+                return this.convertSearchResult(result);
+            }
+            finally
+            {
+                this.builderLock.readLock().unlock();
+            }
+        }
+
+        /**
+         * Computes the search beam width (rerankK), ensuring a minimum exploration effort
+         * regardless of how small k is. This prevents the HNSW search from returning
+         * different top-k results depending on the requested k value.
+         */
+        private int computeRerankK(final int k)
+        {
+            return Math.max(k, this.configuration.minSearchBeamWidth());
+        }
+
+        /**
+         * Searches the in-memory index using a pooled GraphSearcher.
+         */
+        private SearchResult searchInMemoryIndex(final VectorFloat<?> query, final int k, final int rerankK)
+        {
+            final SearchScoreProvider scoreProvider = DefaultSearchScoreProvider.exact(
+                query,
+                this.jvectorSimilarityFunction(),
+                this.createCachingVectorValues()
+            );
+
+            final GraphSearcher searcher = this.inMemorySearcherPool.get();
+            // Refresh the view so the searcher sees nodes added or re-added since pool
+            // initialization (ConcurrentGraphIndexView uses snapshot isolation based on
+            // a completion timestamp captured at creation time).
+            final var view = this.index != null ? this.index.getView() : null;
+            if(view != null)
+            {
+                searcher.setView(view);
+            }
+            final Bits acceptBits = view != null ? view.liveNodes() : Bits.ALL;
+            return searcher.search(scoreProvider, k, rerankK, 0f, 0f, acceptBits);
+        }
+
+        /**
+         * Searches the on-disk index using a pooled GraphSearcher, with optional PQ-based approximate search and reranking.
+         */
+        private SearchResult searchDiskIndex(final VectorFloat<?> query, final int k, final int rerankK)
+        {
+            // If PQ is available, use compressed scoring with reranking
+            if(this.pqManager != null && this.pqManager.isTrained() && this.pqManager.getCompressedVectors() != null)
+            {
+                final GraphSearcher searcher = this.inMemorySearcherPool.get();
+                return this.pqManager.searchWithRerank(
+                    query,
+                    k,
+                    rerankK,
+                    searcher,
+                    this.createCachingVectorValues(),
+                    this.jvectorSimilarityFunction()
+                );
+            }
+
+            // Otherwise, search disk index with exact vectors using pooled searcher
+            final SearchScoreProvider scoreProvider = DefaultSearchScoreProvider.exact(
+                query,
+                this.jvectorSimilarityFunction(),
+                this.createCachingVectorValues()
+            );
+
+            final GraphSearcher searcher = this.inMemorySearcherPool.get();
+            return searcher.search(scoreProvider, k, rerankK, 0f, 0f, Bits.ALL);
+        }
+
+        /**
+         * Searches in incremental mode: queries both the disk graph (for existing data)
+         * and the in-memory builder graph (for new mutations), then merges results.
+         */
+        private SearchResult searchIncremental(final VectorFloat<?> query, final int k, final int rerankK)
+        {
+            final SearchScoreProvider scoreProvider = DefaultSearchScoreProvider.exact(
+                query,
+                this.jvectorSimilarityFunction(),
+                this.createCachingVectorValues()
+            );
+
+            // 1. Search disk graph (excluding deleted/updated ordinals)
+            // Use rerankK as topK to give the merge a richer candidate pool
+            SearchResult diskResult = null;
+            if(this.diskSearcherPool != null)
+            {
+                final GraphSearcher diskSearcher = this.diskSearcherPool.get();
+                final Bits acceptBits = this.createDiskAcceptBits();
+                diskResult = diskSearcher.search(scoreProvider, rerankK, rerankK, 0f, 0f, acceptBits);
+            }
+
+            // 2. Search in-memory graph (new mutations only)
+            SearchResult memResult = null;
+            if(this.inMemorySearcherPool != null && this.index != null && this.index.size(0) > 0)
+            {
+                final GraphSearcher memSearcher = this.inMemorySearcherPool.get();
+                // Capture the view once so setView(...) and liveNodes() agree on the same
+                // snapshot (ConcurrentGraphIndexView uses snapshot isolation — two separate
+                // getView() calls could return different snapshots).
+                final var view = this.index.getView();
+                memSearcher.setView(view);
+                memResult = memSearcher.search(scoreProvider, rerankK, rerankK, 0f, 0f, view.liveNodes());
+            }
+
+            // 3. Merge results — truncate single-source results to k since sub-graphs
+            // over-fetch to provide the merge with a richer candidate pool
+            if(diskResult == null && memResult == null)
+            {
+                return new SearchResult(new SearchResult.NodeScore[0], 0, 0, 0, 0, 0f);
+            }
+            if(diskResult == null)
+            {
+                return this.truncateResult(memResult, k);
+            }
+            if(memResult == null)
+            {
+                return this.truncateResult(diskResult, k);
+            }
+
+            return this.mergeSearchResults(diskResult, memResult, k);
+        }
+
+        /**
+         * Creates accept bits for disk graph search that excludes deleted/updated ordinals.
+         */
+        private Bits createDiskAcceptBits()
+        {
+            if(this.diskDeletedOrdinals == null || this.diskDeletedOrdinals.isEmpty())
+            {
+                return Bits.ALL;
+            }
+
+            // Snapshot into a primitive int[] and find max in a single pass
+            // to avoid Integer[] boxing overhead on every search query.
+            final Set<Integer> deleted = this.diskDeletedOrdinals;
+            final int size = deleted.size();
+            final int[] snapshot = new int[size];
+            int count = 0;
+            int maxOrdinal = -1;
+            for(final Integer ord : deleted)
+            {
+                final int o = ord;
+                if(count < size)
+                {
+                    snapshot[count++] = o;
+                }
+                if(o > maxOrdinal)
+                {
+                    maxOrdinal = o;
+                }
+            }
+
+            if(maxOrdinal < 0)
+            {
+                return Bits.ALL;
+            }
+
+            // Build a primitive boolean[] mask to avoid boxing in the hot search path.
+            final boolean[] deletedMask = new boolean[maxOrdinal + 1];
+            for(int i = 0; i < count; i++)
+            {
+                final int ord = snapshot[i];
+                if(ord >= 0 && ord <= maxOrdinal)
+                {
+                    deletedMask[ord] = true;
+                }
+            }
+
+            return i -> i < 0 || i >= deletedMask.length || !deletedMask[i];
+        }
+
+        /**
+         * Truncates a SearchResult to at most k entries. Used when a single sub-graph
+         * provided all results and the over-fetched candidate pool needs trimming.
+         */
+        private SearchResult truncateResult(final SearchResult result, final int k)
+        {
+            final SearchResult.NodeScore[] nodes = result.getNodes();
+            if(nodes.length <= k)
+            {
+                return result;
+            }
+            return new SearchResult(
+                Arrays.copyOf(nodes, k),
+                result.getVisitedCount(), 0, 0, 0, 0f
+            );
+        }
+
+        /**
+         * Merges two SearchResults: combines nodes, deduplicates by ordinal
+         * (keeping higher score), sorts by score descending, and takes top-k.
+         */
+        private SearchResult mergeSearchResults(
+            final SearchResult diskResult,
+            final SearchResult memResult,
+            final int k
+        )
+        {
+            final SearchResult.NodeScore[] diskNodes = diskResult.getNodes();
+            final SearchResult.NodeScore[] memNodes  = memResult.getNodes();
+            final int totalCandidates = diskNodes.length + memNodes.length;
+
+            if(totalCandidates == 0)
+            {
+                final int visitedCount = diskResult.getVisitedCount() + memResult.getVisitedCount();
+                return new SearchResult(new SearchResult.NodeScore[0], visitedCount, 0, 0, 0, 0f);
+            }
+
+            /*
+             * Primitive open-addressing hash table (int -> float) to deduplicate by ordinal
+             * and to avoid the overhead of HashMap<Integer, Float> boxing
+             */
+            final int tableSize = Integer.highestOneBit(totalCandidates * 2 - 1) << 1;
+            final int[]   keys   = new int  [tableSize];
+            final float[] values = new float[tableSize];
+            Arrays.fill(keys, -1);
+
+            int uniqueCount = 0;
+            for (final SearchResult.NodeScore[] nodes : new SearchResult.NodeScore[][]{diskNodes, memNodes})
+            {
+                for (final SearchResult.NodeScore node : nodes)
+                {
+                    int idx =
+                        (node.node & 0x7fffffff) // strip the sign bit, ensuring a non-negative hash value
+                        & (tableSize - 1) // a fast modulo since tableSize is always a power of two
+                    ;
+                    while (true)
+                    {
+                        if (keys[idx] == -1) // empty slot — node not yet in the table
+                        {
+                            keys[idx] = node.node;
+                            values[idx] = node.score;
+                            uniqueCount++;
+                            break;
+                        }
+                        if (keys[idx] == node.node) // duplicate found — same node already present
+                        {
+                            if (node.score > values[idx])
+                            {
+                                values[idx] = node.score;
+                            }
+                            break;
+                        }
+
+                        // collision — different node occupies this slot
+                        // advance to the next slot
+                        idx = (idx + 1) & (tableSize - 1);
+                    }
+                }
+            }
+
+            // Materialize and sort
+            final SearchResult.NodeScore[] all = new SearchResult.NodeScore[uniqueCount];
+            int outIdx = 0;
+            for(int i = 0; i < tableSize && outIdx < uniqueCount; i++)
+            {
+                if(keys[i] != -1)
+                {
+                    all[outIdx++] = new SearchResult.NodeScore(keys[i], values[i]);
+                }
+            }
+
+            Arrays.sort(all, (a, b) -> Float.compare(b.score, a.score));
+
+            final int resultSize = Math.min(k, all.length);
+            final SearchResult.NodeScore[] merged = resultSize == all.length
+                ? all
+                : Arrays.copyOf(all, resultSize);
+
+            final int visitedCount = diskResult.getVisitedCount() + memResult.getVisitedCount();
+            return new SearchResult(merged, visitedCount, 0, 0, 0, 0f);
+        }
+
+        /**
+         * Creates caching vector values for search operations.
+         * Wrapped with {@link NullSafeVectorValues} so that deleted nodes
+         * (whose vectors are {@code null}) return a safe placeholder instead
+         * of causing NPE/NaN during JVector graph traversal.
+         */
+        private RandomAccessVectorValues createCachingVectorValues()
+        {
+            final RandomAccessVectorValues vectorValues = this.isEmbedded()
+                ? new EntityBackedVectorValues.Caching<>(
+                    this.parentMap(),
+                    this.vectorizer,
+                    this.configuration.dimension(),
+                    this.vectorTypeSupport
+                )
+                : new GigaMapBackedVectorValues.Caching(
+                    this::lookupComputedVector,
+                    // RAVV size() is the dense ordinal upper bound (getVector must be valid for
+                    // [0, size())), NOT the vector count. Graph ordinals are source entity ids, so with
+                    // null embeddings / deletion holes the highest ordinal exceeds vectorStore.size().
+                    // PQ encodeAll() builds a dense PQVectors of this length and FusedPQ / PQ search then
+                    // index it by graph ordinal — an under-reported count skips/overflows high ordinals
+                    // (IndexOutOfBoundsException). Match the graph's ordinal space (see getHighestEntityId()).
+                    () -> Math.toIntExact(this.parentMap().highestUsedId() + 1),
+                    this.configuration.dimension(),
+                    this.vectorTypeSupport
+                );
+            return new NullSafeVectorValues(vectorValues, this.configuration.dimension(), this.vectorTypeSupport);
+        }
+
+        /**
+         * Converts internal SearchResult to VectorSearchResult.
+         */
+        private VectorSearchResult<E> convertSearchResult(final SearchResult result)
+        {
+            final GigaMap<E> parentMap = this.parentMap();
+            final SearchResult.NodeScore[] nodes = result.getNodes();
+            final BulkList<ScoredSearchResult.Entry<E>> entries = BulkList.New(nodes.length);
+            for(final SearchResult.NodeScore node : nodes)
+            {
+                // Ordinals (node) ARE entity IDs, so direct conversion
+                // Pass parentMap for lazy entity access
+                entries.add(new ScoredSearchResult.Entry.Default<>(node.node, node.score, parentMap));
+            }
+            return new VectorSearchResult.Default<>(entries);
+        }
+
+        @Override
+        public void optimize()
+        {
+            // Drain pending indexing operations to ensure graph is complete
+            if(this.isEventualIndexing())
+            {
+                this.backgroundTaskManager.drainQueue();
+            }
+
+            this.doOptimize();
+        }
+
+        /**
+         * Core optimization logic without queue drain.
+         * Called directly from the background task manager's executor thread
+         * (where inline drain is already done) and from the public optimize() method.
+         */
+        @Override
+        public void doOptimize()
+        {
+            final GraphIndexBuilder capturedBuilder;
+
+            // Signal sync-mode mutations to defer builder ops during cleanup.
+            this.cleanupInProgress = true;
+            try
+            {
+                // Barrier: any in-flight GigaMap mutation (which holds the GigaMap monitor)
+                // will complete before we proceed. New mutations see the flag and defer.
+                synchronized(this.parentMap())
+                {
+                    this.ensureIndexInitialized();
+                    capturedBuilder = this.builder;
+                }
+
+                // cleanup() uses ForkJoinPool internally — must be outside
+                // synchronized(parentMap) to avoid deadlock with embedded vectorizers
+                // whose worker threads call parentMap.get().
+                if(capturedBuilder != null)
+                {
+                    // Write lock blocks background worker mutations (readLock) and searches.
+                    this.builderLock.writeLock().lock();
+                    try
+                    {
+                        capturedBuilder.cleanup();
+                    }
+                    finally
+                    {
+                        this.builderLock.writeLock().unlock();
+                    }
+                }
+            }
+            finally
+            {
+                this.cleanupInProgress = false;
+
+                // Apply any deferred sync-mode mutations now that cleanup is done. Inside the finally
+                // so no exit path can strand the queue; builderLock is already released above.
+                this.drainDeferredBuilderOps();
+            }
+
+            this.markStateChangeChildren();
+        }
+
+        @Override
+        public void persistToDisk()
+        {
+            if(!this.configuration.onDisk())
+            {
+                return; // No-op for in-memory indices
+            }
+
+            // Drain pending indexing operations to ensure graph is complete
+            if(this.isEventualIndexing())
+            {
+                this.backgroundTaskManager.drainQueue();
+            }
+
+            this.doPersistToDisk(false);
+        }
+
+        /**
+         * Core persistence logic without queue drain.
+         * Called directly from the background task manager's executor thread
+         * (where inline drain is already done) and from the public persistToDisk() method.
+         *
+         * @param onShutdown {@code true} when invoked on the shutdown path. In incremental mode a
+         *                   shutdown persist skips the O(n) full-graph consolidation entirely and
+         *                   relies on the load-time self-heal, so shutdown is never blocked by a
+         *                   rebuild that would be discarded anyway. {@code false} for
+         *                   background/explicit persistence, which consolidates as before.
+         */
+        @Override
+        public void doPersistToDisk(final boolean onShutdown)
+        {
+            if(!this.configuration.onDisk())
+            {
+                return; // No-op for in-memory indices
+            }
+
+            // Signal sync-mode mutations to defer builder ops during cleanup + disk write.
+            this.cleanupInProgress = true;
+            try
+            {
+                // Acquire write lock for exclusive access during persistence.
+                // This blocks searches, background worker mutations, removeAll, and close.
+                this.builderLock.writeLock().lock();
+                try
+                {
+                    // If incremental mode with no changes, skip persist entirely
+                    if(this.incrementalMode && this.isIncrementalClean())
+                    {
+                        LOG.debug("No incremental changes for '{}', skipping persist", this.name);
+                        return;
+                    }
+
+                    // Captured references for Phase 2 (disk write outside synchronized block)
+                    final OnHeapGraphIndex         capturedIndex  ;
+                    final RandomAccessVectorValues capturedRavv   ;
+                    final PQCompressionManager     capturedPqMgr  ;
+                    final DiskIndexManager         capturedDiskMgr;
+                    final DiskIndexManager.MetaState capturedMeta ;
+
+                    final GraphIndexBuilder        capturedBuilder;
+
+                    // Phase 1: Barrier + reference capture inside synchronized(parentMap).
+                    // The barrier ensures any in-flight GigaMap mutation completes.
+                    // New mutations see cleanupInProgress=true and defer.
+                    synchronized(this.parentMap())
+                    {
+                        this.ensureIndexInitialized();
+
+                        // If in incremental mode, exit it first by rebuilding the full graph.
+                        // Must happen inside synchronized(parentMap) so that
+                        // rebuildGraphFromStore() does not race with in-flight mutations.
+                        if(this.incrementalMode)
+                        {
+                            if(onShutdown)
+                            {
+                                // The on-disk index is a derived cache. Skip the O(n) full-graph
+                                // consolidation on shutdown and let the load-time self-heal
+                                // (DiskIndexManager.verifyMetadata) rebuild from the store — the
+                                // source of truth — on the next boot. No vectors are lost, and
+                                // shutdown is not blocked by a rebuild that would be discarded
+                                // anyway. Full consolidation stays a background/explicit operation.
+                                LOG.info("Skipping full-graph consolidation for '{}' on shutdown; "
+                                    + "on-disk index self-heals from store on next load", this.name);
+                                return;
+                            }
+                            this.exitIncrementalMode();
+                        }
+
+                        // If we have an in-memory builder, prepare for disk write
+                        if(this.builder == null || this.index == null)
+                        {
+                            return;
+                        }
+
+                        // Initialize disk manager if needed
+                        if(this.diskManager == null)
+                        {
+                            this.diskManager = new DiskIndexManager.Default(
+                                this,
+                                this.name,
+                                this.configuration.indexDirectory(),
+                                this.configuration.dimension(),
+                                this.configuration.maxDegree(),
+                                this.configuration.parallelOnDiskWrite()
+                            );
+                        }
+
+                        // Capture references for use outside the synchronized block.
+                        // The parentMap monitor is released before cleanup and disk write
+                        // so that worker threads (ForkJoinPool in cleanup, disk writer)
+                        // can freely call parentMap.get() without deadlocking.
+                        capturedBuilder = this.builder;
+                        capturedIndex   = this.index;
+                        capturedRavv    = new NullSafeVectorValues(
+                            this.createVectorValues(), this.configuration.dimension(), this.vectorTypeSupport
+                        );
+                        capturedPqMgr   = this.pqManager;
+                        capturedDiskMgr = this.diskManager;
+
+                        // Sample the .meta witnesses at the same instant the graph is captured, under
+                        // the monitor, so a Phase-2 vec↔null mutation cannot advance them past the
+                        // written graph (see DiskIndexManager.MetaState).
+                        capturedMeta    = new DiskIndexManager.MetaState(
+                            this.getExpectedVectorCount(),
+                            this.getHighestEntityId(),
+                            this.getStructuralModCount()
+                        );
+                    }
+
+                    // Phase 2: Cleanup and disk write outside synchronized(parentMap).
+                    // builderLock.writeLock() is still held, blocking searches,
+                    // background worker mutations, removeAll, and close.
+                    // parentMap monitor is released, so ForkJoinPool workers and
+                    // disk writer threads can call parentMap.get() for embedded vectors.
+
+                    // Test-only injection point: exercises the window where a sync mutation defers a
+                    // builder op that is drained only after the builder is swapped below. No-op in prod.
+                    final Runnable hook = this.persistPhase2TestHook;
+                    if(hook != null)
+                    {
+                        hook.run();
+                    }
+
+                    capturedBuilder.cleanup();
+                    capturedDiskMgr.writeIndex(capturedIndex, capturedRavv, capturedPqMgr, capturedMeta);
+
+                    // After writing, re-enter incremental mode for fast subsequent operation
+                    this.reenterIncrementalMode(capturedMeta);
+                }
+                catch(final IOException ioe)
+                {
+                    throw new IORuntimeException(ioe);
+                }
+                finally
+                {
+                    this.builderLock.writeLock().unlock();
+                }
+            }
+            finally
+            {
+                this.cleanupInProgress = false;
+
+                // Apply any deferred sync-mode mutations now that cleanup + persistence is done.
+                // Inside the finally so the early returns above (incremental-clean, shutdown skip,
+                // no builder) cannot strand the queue; builderLock is already released above.
+                this.drainDeferredBuilderOps();
+            }
+        }
+
+        /**
+         * Returns true if incremental mode has no pending changes:
+         * no deletions from disk and the in-memory builder graph is empty.
+         */
+        private boolean isIncrementalClean()
+        {
+            final boolean noDeletions = this.diskDeletedOrdinals == null || this.diskDeletedOrdinals.isEmpty();
+            final boolean noNewNodes  = this.index == null || this.index.size(0) == 0;
+            return noDeletions && noNewNodes;
+        }
+
+        /**
+         * Exits incremental mode by closing disk resources, rebuilding the full graph
+         * from stored vectors, and resetting incremental state.
+         * Must be called under builderLock.writeLock().
+         */
+        private void exitIncrementalMode()
+        {
+            LOG.info("Exiting incremental on-disk mode for '{}' — rebuilding full graph for persist", this.name);
+
+            // Close disk manager (disk searcher pool is closed by closeSearcherPool below)
+            if(this.diskManager != null)
+            {
+                this.diskManager.close();
+                this.diskManager = null;
+            }
+
+            // Reset incremental state
+            this.incrementalMode = false;
+            if(this.diskDeletedOrdinals != null)
+            {
+                this.diskDeletedOrdinals.clear();
+                this.diskDeletedOrdinals = null;
+            }
+
+            // Close existing in-memory builder and index
+            if(this.builder != null)
+            {
+                try
+                {
+                    this.builder.close();
+                }
+                catch(final IOException e)
+                {
+                    LOG.warn("Error closing builder during exitIncrementalMode: {}", e.getMessage());
+                }
+                this.builder = null;
+            }
+            if(this.index != null)
+            {
+                this.index.close();
+                this.index = null;
+            }
+
+            // Close searcher pool (will be re-created)
+            this.closeSearcherPools();
+
+            // Reinitialize builder and rebuild full graph from stored vectors
+            this.initializeInMemoryBuilder();
+            this.rebuildGraphFromStore();
+            this.initializeSearcherPool();
+
+            // The full in-memory graph now exists: mark the (deferred) rebuild done so a later
+            // first-access ensureGraphRebuilt() does not rebuild a second time on top of this one.
+            this.graphRebuilt = true;
+        }
+
+        /**
+         * Re-enters incremental mode after a disk write: reloads the disk index,
+         * resets the in-memory builder to empty, and sets incremental state.
+         * Must be called under builderLock.writeLock().
+         * <p>
+         * The reload is validated against {@code writtenMeta} - the witnesses that were just stamped
+         * into the {@code .meta} - and NOT against the live store state. Persist Phase 2 runs with the
+         * parentMap monitor released, so under sustained writes the live counters always advance past
+         * the written graph and a live comparison would reject the file we just produced ourselves,
+         * dropping the index into full in-memory mode for the rest of the session (internal #142).
+         * Those newer mutations are not lost: they are exactly the ops sitting in
+         * {@code deferredBuilderOps}, which the drain then applies on top of the reloaded graph -
+         * which is what incremental mode is for. Crash-restart safety is unaffected: the store
+         * counter now legitimately exceeds the {@code .meta} counter, so a restart before the next
+         * persist still rejects the disk graph and rebuilds from the store.
+         *
+         * @param writtenMeta the witnesses stamped into the {@code .meta} by the preceding write
+         */
+        private void reenterIncrementalMode(final DiskIndexManager.MetaState writtenMeta)
+        {
+            // Close existing disk manager if present
+            if(this.diskManager != null)
+            {
+                this.diskManager.close();
+                this.diskManager = null;
+            }
+
+            // Recreate disk manager and load the just-written index
+            this.diskManager = new DiskIndexManager.Default(
+                this,
+                this.name,
+                this.configuration.indexDirectory(),
+                this.configuration.dimension(),
+                this.configuration.maxDegree(),
+                this.configuration.parallelOnDiskWrite()
+            );
+
+            if(this.diskManager.tryLoad(writtenMeta))
+            {
+                if(this.pqManager != null)
+                {
+                    this.pqManager.markTrained();
+                }
+
+                // Reset in-memory builder to empty (all data is now on disk)
+                if(this.builder != null)
+                {
+                    try
+                    {
+                        this.builder.close();
+                    }
+                    catch(final IOException e)
+                    {
+                        LOG.warn("Error closing builder during reenterIncrementalMode: {}", e.getMessage());
+                    }
+                }
+                if(this.index != null)
+                {
+                    this.index.close();
+                }
+
+                this.initializeInMemoryBuilder();
+
+                // Set incremental state: set state fields first, then flip incrementalMode last for safe publication.
+                this.diskDeletedOrdinals = ConcurrentHashMap.newKeySet();
+                this.incrementalMode     = true;
+
+                // Reinitialize searcher pools (disk + in-memory)
+                this.closeSearcherPools();
+                this.initializeSearcherPool();
+
+                LOG.info("Re-entered incremental on-disk mode for '{}'", this.name);
+            }
+            else
+            {
+                LOG.warn("Failed to reload disk index for '{}' after persist, staying in full in-memory mode", this.name);
+            }
+        }
+
+        @Override
+        public void trainCompressionIfNeeded()
+        {
+            if(this.pqManager != null)
+            {
+                synchronized(this.parentMap())
+                {
+                    this.ensureIndexInitialized();
+                    this.pqManager.trainIfNeeded();
+                }
+            }
+        }
+
+        @Override
+        public void clearStateChangeMarkers()
+        {
+            super.clearStateChangeMarkers();
+        }
+
+        @Override
+        protected void storeChangedChildren(final Storer storer)
+        {
+            if(!this.isEmbedded())
+            {
+                storer.store(this.vectorStore);
+            }
+        }
+
+        @Override
+        protected void clearChildrenStateChangeMarkers()
+        {
+            // No child state change markers to clear
+        }
+
+        @Override
+        public void close()
+        {
+            // Shutdown background task manager — drain indexing, optionally optimize and persist
+            this.shutdownBackgroundTaskManager(
+                true,
+                this.configuration.optimizeOnShutdown(),
+                this.configuration.persistOnShutdown()
+            );
+
+            // Acquire write lock to ensure no concurrent search or persistToDisk() is running.
+            // closeInternalResources() destroys the graph and disk manager.
+            this.builderLock.writeLock().lock();
+            try
+            {
+                this.closeInternalResources();
+            }
+            finally
+            {
+                this.builderLock.writeLock().unlock();
+            }
+        }
+
+        /**
+         * Shuts down the background task manager.
+         *
+         * @param drainPending    if true, drain all pending indexing operations
+         * @param optimizePending if true and there are pending changes, optimize before shutdown
+         * @param persistPending  if true and there are pending changes, persist before shutdown
+         */
+        private void shutdownBackgroundTaskManager(
+            final boolean drainPending,
+            final boolean optimizePending,
+            final boolean persistPending
+        )
+        {
+            if(this.backgroundTaskManager != null)
+            {
+                if(!drainPending)
+                {
+                    this.backgroundTaskManager.discardQueue();
+                }
+                this.backgroundTaskManager.shutdown(drainPending, optimizePending, persistPending);
+                this.backgroundTaskManager = null;
+            }
+            else if(persistPending && this.configuration.onDisk())
+            {
+                // Honor persistOnShutdown for on-disk indices configured without
+                // any background features (no eventual indexing, no background
+                // optimization, no background persistence).
+                try
+                {
+                    this.doPersistToDisk(true);
+                }
+                catch(final Exception e)
+                {
+                    LOG.error("Shutdown persistence failed for '{}': {}", this.name, e.getMessage(), e);
+                }
+            }
+        }
+
+        /**
+         * Closes internal resources (builder, index, disk resources).
+         * Must be called within synchronized block.
+         */
+        private void closeInternalResources()
+        {
+            // Close searcher pools first (searchers reference the index)
+            this.closeSearcherPools();
+
+            // Reset incremental mode state
+            this.incrementalMode = false;
+            if(this.diskDeletedOrdinals != null)
+            {
+                this.diskDeletedOrdinals.clear();
+                this.diskDeletedOrdinals = null;
+            }
+
+            if(this.builder != null)
+            {
+                try
+                {
+                    this.builder.close();
+                }
+                catch(final IOException e)
+                {
+                    throw new RuntimeException("Failed to close index builder", e);
+                }
+                this.builder = null;
+            }
+
+            if(this.index != null)
+            {
+                this.index.close();
+                this.index = null;
+            }
+
+            // Close disk manager
+            if(this.diskManager != null)
+            {
+                this.diskManager.close();
+                this.diskManager = null;
+            }
+
+            // Reset PQ manager
+            if(this.pqManager != null)
+            {
+                this.pqManager.reset();
+                this.pqManager = null;
+            }
+        }
+
+        /**
+         * Creates appropriate vector values based on storage mode.
+         */
+        private RandomAccessVectorValues createVectorValues()
+        {
+            return this.isEmbedded()
+                ? new EntityBackedVectorValues<>(
+                    this.parentMap(),
+                    this.vectorizer,
+                    this.configuration.dimension(),
+                    this.vectorTypeSupport
+                )
+                : new GigaMapBackedVectorValues(
+                    this::lookupComputedVector,
+                    // RAVV size() is the dense ordinal upper bound (getVector must be valid for
+                    // [0, size())), NOT the vector count. Graph ordinals are source entity ids, so with
+                    // null embeddings / deletion holes the highest ordinal exceeds vectorStore.size().
+                    // PQ encodeAll() builds a dense PQVectors of this length and FusedPQ / PQ search then
+                    // index it by graph ordinal — an under-reported count skips/overflows high ordinals
+                    // (IndexOutOfBoundsException). Match the graph's ordinal space (see getHighestEntityId()).
+                    () -> Math.toIntExact(this.parentMap().highestUsedId() + 1),
+                    this.configuration.dimension(),
+                    this.vectorTypeSupport
+                );
+        }
+
+
+        ///////////////////////////////////////////////////////////////////////////
+        // callback interface implementations //
+        ////////////////////////////////////////
+
+        // PQCompressionManager.VectorProvider
+
+        @Override
+        public long getVectorCount()
+        {
+            return this.getExpectedVectorCount();
+        }
+
+        @Override
+        public List<VectorFloat<?>> collectTrainingVectors()
+        {
+            final List<VectorFloat<?>> vectors = new ArrayList<>();
+
+            if(this.isEmbedded())
+            {
+                this.parentMap().iterate(entity ->
+                {
+                    final float[] vector = this.vectorize(entity);
+                    // Skip entities without an embedding — they are not part of the graph and
+                    // must not feed PQ codebook training.
+                    if(vector != null)
+                    {
+                        vectors.add(this.vectorTypeSupport.createFloatVector(vector));
+                    }
+                });
+            }
+            else if(this.vectorStore != null)
+            {
+                // Computed mode never stores null-vector entries; guard defensively anyway.
+                this.vectorStore.iterate(entry ->
+                {
+                    if(entry.vector != null)
+                    {
+                        vectors.add(this.vectorTypeSupport.createFloatVector(entry.vector));
+                    }
+                });
+            }
+
+            return vectors;
+        }
+
+        // DiskIndexManager.IndexStateProvider
+
+        @Override
+        public long getExpectedVectorCount()
+        {
+            // Counts indexed entities, NOT graph nodes. In computed mode the two are equal
+            // (null-vector entities have no store entry). In embedded mode this can over-count
+            // when some entities have no embedding — that is fine for the disk metadata check,
+            // which compares this value against itself on write and read, and for the PQ
+            // training gate, which trains on the actually-collected (non-null) vectors.
+            if(this.isEmbedded())
+            {
+                return this.parentMap().size();
+            }
+            else
+            {
+                return this.vectorStore != null ? this.vectorStore.size() : 0;
+            }
+        }
+
+        @Override
+        public long getHighestEntityId()
+        {
+            // Always use the parent GigaMap's id space — that is the ordinal
+            // space the HNSW graph is keyed on (via toOrdinal(entityId)) in
+            // both embedded and computed-vector modes. The computed-mode
+            // vectorStore has its own monotonic id allocator that diverges
+            // from the parent map's (e.g. when an index is registered against
+            // a parent with deletion holes, or when some entities have no
+            // embedding and so get no vectorStore entry at all), so it is
+            // unsafe as a stand-in. Note this is only about the highest-id
+            // bound: per-entity vector lookups no longer assume alignment —
+            // they resolve by VectorEntry.sourceEntityId (see lookupComputedVector).
+            return this.parentMap().highestUsedId();
+        }
+
+        @Override
+        public long getStructuralModCount()
+        {
+            // The persisted witness stamped into the disk .meta at write time and compared on
+            // reload. Unlike count/highestId it changes on vec↔null transitions, closing the
+            // crash-restart window where a stale on-disk graph would otherwise be accepted.
+            return this.structuralModCount;
+        }
+
+        // ================================================================
+        // BackgroundTaskManager.Callback implementation
+        // ================================================================
+
+        @Override
+        public void applyGraphAdd(final VectorEntry entry)
+        {
+            // Called from the background indexing worker thread (not from GigaMap's
+            // synchronized methods), so we use builderLock.readLock() to coordinate
+            // with cleanup (writeLock).
+            if(entry.vector == null)
+            {
+                // Entity has no embedding — nothing to add to the graph. Callers already
+                // filter these out; this is a defensive guard on the worker thread.
+                return;
+            }
+            this.builderLock.readLock().lock();
+            try
+            {
+                final int ordinal = toOrdinal(entry.sourceEntityId);
+                final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(entry.vector);
+                this.builder.addGraphNode(ordinal, vf);
+            }
+            finally
+            {
+                this.builderLock.readLock().unlock();
+            }
+        }
+
+        @Override
+        public void applyGraphBatchAdd(final List<VectorEntry> entries)
+        {
+            // Acquires the lock once for the entire batch, avoiding per-entry lock overhead.
+            this.builderLock.readLock().lock();
+            try
+            {
+                for(final var entry : entries)
+                {
+                    if(entry.vector == null)
+                    {
+                        // Entity has no embedding — excluded from the graph.
+                        continue;
+                    }
+                    final int ordinal = toOrdinal(entry.sourceEntityId);
+                    final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(entry.vector);
+                    this.builder.addGraphNode(ordinal, vf);
+                }
+            }
+            finally
+            {
+                this.builderLock.readLock().unlock();
+            }
+        }
+
+        @Override
+        public void applyGraphUpdate(final VectorEntry entry)
+        {
+            this.builderLock.readLock().lock();
+            try
+            {
+                final int ordinal = toOrdinal(entry.sourceEntityId);
+                final boolean inGraph = this.index != null && this.index.containsNode(ordinal);
+
+                if(entry.vector == null)
+                {
+                    // vec→null / null→null: remove the node if present, otherwise nothing to do.
+                    if(inGraph)
+                    {
+                        this.builder.markNodeDeleted(ordinal);
+                    }
+                    return;
+                }
+
+                // vec→vec: delete the stale node then re-add. null→vec: the node is absent,
+                // so add it directly without the (invalid) delete.
+                if(inGraph)
+                {
+                    this.builder.markNodeDeleted(ordinal);
+                    this.builder.removeDeletedNodes();
+                }
+                final VectorFloat<?> vf = this.vectorTypeSupport.createFloatVector(entry.vector);
+                this.builder.addGraphNode(ordinal, vf);
+            }
+            finally
+            {
+                this.builderLock.readLock().unlock();
+            }
+        }
+
+        @Override
+        public void applyGraphRemove(final int ordinal)
+        {
+            this.builderLock.readLock().lock();
+            try
+            {
+                // Guard against removing a never-indexed entity (e.g. one that never had an
+                // embedding): markNodeDeleted on an absent node would fail.
+                if(this.index != null && this.index.containsNode(ordinal))
+                {
+                    this.builder.markNodeDeleted(ordinal);
+                }
+            }
+            finally
+            {
+                this.builderLock.readLock().unlock();
+            }
+        }
+
+
+        // ================================================================
+        // Builder operation deferral helpers
+        // ================================================================
+
+        /**
+         * Marks a graph ordinal deleted, re-deriving the target from CURRENT state at execution time
+         * rather than from a captured builder reference. This matters when the op is deferred
+         * (via {@link #executeOrDeferBuilderOp}) during a persist and drained afterwards: {@code
+         * doPersistToDisk} swaps the in-memory builder (exit/reenter incremental mode) between deferral
+         * and drain, so a captured {@code builder.markNodeDeleted(ordinal)} would land on the new, empty
+         * builder and be lost — leaving the entity live on the reloaded disk graph until the next
+         * persist. Recording the deletion in {@link #diskDeletedOrdinals} (when incremental) makes it
+         * survive the swap; the in-builder {@code markNodeDeleted} is applied only when the node is
+         * actually present in the current builder.
+         */
+        private void internalMarkOrdinalDeleted(final int ordinal)
+        {
+            this.recordDiskOrdinalSuperseded(ordinal);
+            final GraphIndexBuilder currentBuilder = this.builder;
+            if(currentBuilder != null && graphOf(currentBuilder).containsNode(ordinal))
+            {
+                currentBuilder.markNodeDeleted(ordinal);
+            }
+        }
+
+        /**
+         * Records that the disk-resident version of an ordinal is no longer authoritative, so
+         * {@link #createDiskAcceptBits()} excludes it from disk search.
+         * <p>
+         * Must be called by every op that removes or re-adds an ordinal in the in-memory builder while
+         * incremental mode is active, and it must be called when the op RUNS, not when it is created:
+         * a persist allocates a fresh, empty {@link #diskDeletedOrdinals} in
+         * {@code reenterIncrementalMode}, so an entry made before deferral is gone by the time the op
+         * is drained, and the stale disk node would keep answering searches next to the fresh
+         * in-memory one (internal #142).
+         * <p>
+         * Not called for a plain add: a newly allocated entity id was never written to disk, so
+         * recording it would only enlarge the {@code boolean[maxOrdinal+1]} mask that
+         * {@code createDiskAcceptBits()} rebuilds on every search.
+         */
+        private void recordDiskOrdinalSuperseded(final int ordinal)
+        {
+            if(this.incrementalMode && this.diskDeletedOrdinals != null)
+            {
+                this.diskDeletedOrdinals.add(ordinal);
+            }
+        }
+
+        /**
+         * Replaces a graph node with a new vector, re-deriving every premise from CURRENT state at
+         * execution time. Used by the computed (non-embedded) update path, whose deferred op may be
+         * drained against a builder that was swapped since the op was created.
+         * <p>
+         * The removal half must never be skipped while the add half runs unconditionally: jvector's
+         * {@code OnHeapGraphIndex.addNode} is a non-atomic loop over layers {@code 0..level} that
+         * throws {@code IllegalStateException: Node N already exists} on the first layer already
+         * holding the ordinal, and {@code containsNode} only inspects layer 0. So the final
+         * {@code removeNode} is not redundant with {@code removeDeletedNodes}: it purges the ordinal
+         * from ALL layers and thereby also repairs a node left in an upper layer only by an earlier
+         * interleaved add/remove (internal #142).
+         * <p>
+         * Only safe for the computed vectorizer: {@code removeDeletedNodes()} scores through a
+         * ForkJoinPool, whose workers read the separate vector store rather than the parent GigaMap,
+         * so it cannot deadlock against the GigaMap monitor the drain holds.
+         */
+        private void internalReplaceGraphNode(final int ordinal, final VectorFloat<?> vf)
+        {
+            this.recordDiskOrdinalSuperseded(ordinal);
+            final GraphIndexBuilder currentBuilder = this.builder;
+            if(currentBuilder == null)
+            {
+                return;
+            }
+            final OnHeapGraphIndex currentIndex = graphOf(currentBuilder);
+            if(currentIndex.containsNode(ordinal))
+            {
+                // Repairs the neighbor lists that referenced the node before dropping it.
+                currentBuilder.markNodeDeleted(ordinal);
+                currentBuilder.removeDeletedNodes();
+            }
+            currentIndex.removeNode(ordinal);
+            currentBuilder.addGraphNode(ordinal, vf);
+        }
+
+        /**
+         * Adds a graph node, tolerating an ordinal that is already present. Monitor-safe: it never
+         * calls {@code removeDeletedNodes()}, whose ForkJoinPool workers resolve vectors through the
+         * parent GigaMap for an embedded vectorizer and would deadlock against the monitor the caller
+         * holds. The re-added node loses its neighbor links, which the next optimize/persist rebuilds
+         * - the same contract the embedded vec-vec path documents.
+         * <p>
+         * Re-deriving presence here rather than at deferral time is what makes the op idempotent
+         * against whatever builder it is eventually drained into (internal #142).
+         */
+        private void internalAddGraphNodeIdempotent(final int ordinal, final VectorFloat<?> vf)
+        {
+            final GraphIndexBuilder currentBuilder = this.builder;
+            if(currentBuilder == null)
+            {
+                return;
+            }
+            graphOf(currentBuilder).removeNode(ordinal);
+            currentBuilder.addGraphNode(ordinal, vf);
+        }
+
+        /**
+         * {@link #internalAddGraphNodeIdempotent} for an ordinal that may already have a version on
+         * disk, i.e. the embedded {@code null→vec} update path. Masks the disk-resident node first so
+         * search does not answer from both copies.
+         */
+        private void internalReaddGraphNode(final int ordinal, final VectorFloat<?> vf)
+        {
+            this.recordDiskOrdinalSuperseded(ordinal);
+            this.internalAddGraphNodeIdempotent(ordinal, vf);
+        }
+
+        /**
+         * Re-adds or resurrects an embedded-mode node, deciding from CURRENT state at execution time.
+         * A node marked deleted only carries a bit (it stays in every layer), so clearing that bit is
+         * enough and keeps the op monitor-safe; a node that is gone entirely - e.g. because the
+         * builder was swapped between deferral and drain - must be added instead, otherwise the
+         * entity silently disappears from the graph.
+         */
+        private void internalResurrectGraphNode(final int ordinal, final VectorFloat<?> vf)
+        {
+            this.recordDiskOrdinalSuperseded(ordinal);
+            final GraphIndexBuilder currentBuilder = this.builder;
+            if(currentBuilder == null)
+            {
+                return;
+            }
+            final OnHeapGraphIndex currentIndex = graphOf(currentBuilder);
+            if(currentIndex.containsNode(ordinal))
+            {
+                currentIndex.getDeletedNodes().clear(ordinal);
+                return;
+            }
+            // containsNode only inspects layer 0, so "absent" can still mean "present in an upper
+            // layer" after an earlier interleaved add/remove. Purge all layers before adding, or the
+            // add throws the very IllegalStateException this change is about.
+            currentIndex.removeNode(ordinal);
+            currentBuilder.addGraphNode(ordinal, vf);
+        }
+
+        private static OnHeapGraphIndex graphOf(final GraphIndexBuilder builder)
+        {
+            return (OnHeapGraphIndex)builder.getGraph();
+        }
+
+        /**
+         * Executes a builder operation immediately, or defers it if cleanup is in progress.
+         * Used by sync-mode mutations (called from GigaMap's synchronized methods) which
+         * cannot acquire builderLock without risking deadlock with embedded vectorizers.
+         */
+        private void executeOrDeferBuilderOp(final Runnable op)
+        {
+            if(this.cleanupInProgress)
+            {
+                this.deferredBuilderOps.add(op);
+            }
+            else
+            {
+                op.run();
+            }
+        }
+
+        /**
+         * Drains and executes all deferred builder operations.
+         * Called after cleanup completes (cleanupInProgress is already false).
+         * <p>
+         * Runs under {@code synchronized(parentMap())} because that monitor is the only lock the
+         * sync-mode mutation paths hold: without it the persist/optimize threads drain the queue
+         * bare (they release builderLock before draining) and race the application thread, which
+         * drains and executes the very same kind of op inline. Two such threads both seeing
+         * {@code containsNode(ordinal) == false} both call {@code addGraphNode} and one dies with
+         * {@code IllegalStateException: Node N already exists}, aborting the drain and killing the
+         * persist cycle for good (internal #142). The monitor is the outermost lock here - the
+         * persist/optimize drains hold nothing at this point - so it introduces no lock inversion.
+         * <p>
+         * INVARIANT: a deferred op must never enter a ForkJoinPool whose workers need this monitor.
+         * {@code addGraphNode} never does; {@code removeDeletedNodes()} does, and is therefore
+         * reachable only from the computed path, which scores through the separate vector store.
+         * <p>
+         * A failing op is logged and skipped rather than allowed to abort the drain: the op is
+         * already polled and lost either way, but stranding the rest of the queue would leave the
+         * index unable to ever persist again.
+         */
+        private void drainDeferredBuilderOps()
+        {
+            final Runnable entryHook = this.drainEntryTestHook;
+            if(entryHook != null)
+            {
+                entryHook.run();
+            }
+
+            synchronized(this.parentMap())
+            {
+                Runnable op;
+                while((op = this.deferredBuilderOps.poll()) != null)
+                {
+                    try
+                    {
+                        op.run();
+                    }
+                    catch(final RuntimeException e)
+                    {
+                        LOG.error("Deferred builder operation failed for index '{}', skipping it: {}",
+                            this.name, e.getMessage(), e);
+                    }
+                }
+            }
+        }
+
+    }
+
+}

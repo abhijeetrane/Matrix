@@ -1,0 +1,333 @@
+= Spring Boot Integration
+
+image::https://upload.wikimedia.org/wikipedia/commons/4/44/Spring_Framework_Logo_2018.svg[]
+
+{product-name} comes with a Spring Boot integration.
+It is available within this artifact:
+
+[source, xml, title="pom.xml", subs=attributes+]
+----
+<dependencies>
+   <dependency>
+      <groupId>org.eclipse.store</groupId>
+      <artifactId>integrations-spring-boot3</artifactId>
+      <version>{maven-version}</version>
+   </dependency>
+</dependencies>
+----
+
+Official Spring Boot site: https://spring.io/projects/spring-boot[]
+
+The integration requires Spring Boot 3.x.
+
+== Configuration
+
+The configuration of the _StorageManager_ can be done using key/value pairs that are provided by Spring Boot external Configuration.  The configuration keys must be prefixed by `org.eclipse.store`
+
+[source,properties]
+----
+org.eclipse.store.storage-directory=/opt/data/eclipse-store-storage
+org.eclipse.store.channel-count=2
+----
+
+The list of all {product-name} configuration properties and their meaning are listed on our xref:storage:configuration/properties.adoc[documentation page].
+
+The configuration values are handled using the https://docs.spring.io/spring-boot/docs/current/reference/html/features.html#features.external-config.typesafe-configuration-properties[typesafe configuration] approach, and you can read these values by accessing the `EclipseStoreProperties` Spring bean.
+The Spring Boot integration provides a set of Bean Factories which read the configuration and initialize the relevant {product-name} facilities for you,
+including `EmbeddedStorageManager`.
+
+== StorageManager injection
+
+The simplest way to use this integration is when you can externalize all the configuration using Spring configuration files. Subsequently, you just create a Spring Boot application and add a dependency on the integration. Then, in the Bean where you need access to the StorageManager, you add the `@Autowired` annotation and a StorageManager is created for you. All configuration values are loaded from the external configuration and the StorageManager is already initialized and ready to use.
+
+=== Example:
+[source,java]
+----
+@SpringBootApplication
+public class SomeSpringApplication
+{
+    public static void main(String... args)
+    {
+        SpringApplication.run(SomeSpringApplication.class, args);
+    }
+}
+
+@Component
+public class JokesStorageImpl implements JokesStorage
+{
+    private final EmbeddedStorageManager storageManager;
+
+    // Inject the StorageManager (Constructor injection)
+    public JokesStorageImpl(EmbeddedStorageManager storageManager)
+    {
+        this.storageManager = storageManager;
+    }
+
+    // Implement the JokesStorage interface
+}
+----
+
+== Configuration Injection
+
+In case you need to modify the configuration in some way in the program, change something, add and the like, you can have the `EclipseStoreProperties` Spring bean injected into your class.
+This class contains all the configuration values that are used to create a `StorageManager`.
+You can modify these values and then use the `EmbeddedStorageManagerFactory` Bean to create
+a new `EmbeddedStorageManager` or `EmbeddedStorageFoundationFactory` to create a new  `EmbeddedStorageFoundation`.
+
+[source,java]
+----
+    @Bean
+    EmbeddedStorageManager injectStorageTest(
+        @Autowired EclipseStoreProperties myConfiguration,
+        @Autowired EmbeddedStorageManagerFactory managerFactory,
+        @Autowired EmbeddedStorageFoundationFactory foundationFactory
+   ) {
+        // Modify the configuration
+        myConfiguration.setStorageDirectory(temp.getDir().getAbsolutePath());
+        // Create a new StorageFoundation
+        EmbeddedStorageFoundation<?> storageFoundation = foundationFactory.createStorageFoundation(myConfiguration);
+
+        // Modify the storageFoundation
+        //storageFoundation.onConnectionFoundation(f -> f.someOperation);
+
+        // Create a new StorageManager
+        return managerFactory.createEmbeddedStorageManager(storageFoundation, true);
+    }
+
+----
+
+== Autostart
+- The _StorageManager_ is already started unless you specified the configuration value `org.eclipse.store.auto-start=false`.
+- If you have used the `org.eclipse.store.root` configuration item, the _StorageManager_ is already associated with an instance of that class as the Root object. This class must have a default or public no-argument constructor.
+
+It is also possible to obtain the entire configuration within the `StorageManagerConfiguration` Bean, enabling you to directly create a foundation and storage manager. This can be helpful if you need to stop storage at runtime and then restart it.
+
+== Disable Auto StorageManager creation
+If the user does not define any beans of type _EmbeddedStorageFoundation_ and _EmbeddedStorageManager_, these beans are automatically created. This behavior can be changed using the following configuration.
+[source,properties]
+----
+org.eclipse.store.auto-create-default-storage=false
+org.eclipse.store.auto-create-default-foundation=false
+----
+
+== Multiple Storage Managers
+
+You can have a more than one Storage Manager in your application. This can be useful if you want to have different storage targets for different data. For example, you might want to have a datastore for your user data and another for your product data. You can do this by creating multiple configuration classes and multiple Storage Managers.
+
+[source,java]
+----
+@Configuration
+public class TwoBeanConfiguration
+{
+
+    @Autowired
+    private EmbeddedStorageFoundationFactory foundationFactory;
+    @Autowired
+    private EmbeddedStorageManagerFactory managerFactory;
+
+    @Bean("first_config")
+    @ConfigurationProperties("org.eclipse.store.first")
+    EclipseStoreProperties firstStoreProperties()
+    {
+        return new EclipseStoreProperties();
+    }
+
+    @Bean("second_config")
+    @ConfigurationProperties("org.eclipse.store.second")
+    EclipseStoreProperties secondStoreProperties()
+    {
+        return new EclipseStoreProperties();
+    }
+
+    @Bean
+    @Qualifier("first_storage")
+    EmbeddedStorageManager createFirstStorage(@Qualifier("first_config") final EclipseStoreProperties firstStoreProperties) {
+      return managerFactory.createStorage(
+          foundationFactory.createStorageFoundation(firstStoreProperties),
+          firstStoreProperties.isAutoStart()
+      );
+    }
+
+    @Bean
+    @Qualifier("second_storage")
+    EmbeddedStorageManager createSecondStorage(@Qualifier("second_config") final EclipseStoreProperties secondStoreProperties) {
+      return managerFactory.createStorage(
+          foundationFactory.createStorageFoundation(secondStoreProperties),
+          secondStoreProperties.isAutoStart()
+      );
+    }
+
+}
+----
+
+The configuration properties are defined in the `application.properties` file with appropriate prefixes.
+
+[source,properties]
+----
+org.eclipse.store.first.storage-directory=${java.io.tmpdir}/${random.int}
+org.eclipse.store.first.auto-start=false
+org.eclipse.store.first.root=org.eclipse.store.integrations.spring.boot.types.storages.FirstRoot
+
+org.eclipse.store.second.storage-directory=${java.io.tmpdir}/${random.int}
+org.eclipse.store.second.auto-start=false
+org.eclipse.store.second.root=org.eclipse.store.integrations.spring.boot.types.storages.SecondRoot
+----
+
+== Mutex Locking
+
+TIP: See xref:intro:concurrent-access.adoc[Concurrent Access] for the full conceptual treatment.
+
+{product-name} supports mutex locking. This is useful if you have multiple processes that need to access the same objects. Easiest way to use it is to use the annotation `@Read` and `@Write` on the methods that need to be locked. The annotation `@Read` is used for methods that only read data and `@Write` is used for methods that modify data.
+
+[IMPORTANT]
+====
+A `@Write` method *must* contain both the object graph modification and the corresponding `store()` call.
+If the mutation and the store happen in separate methods (or outside the lock), other threads may observe inconsistent state.
+This is the same principle described in xref:misc:locking/index.adoc[Locking]: modifying the object graph and storing the changes must always be done under the same lock.
+====
+
+To activate  mutex locking, you need to add the following dependency to Maven pom.xml of your SpringBoot application:
+
+[source, xml, title="pom.xml", subs=attributes+]
+----
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-aop</artifactId>
+    </dependency>
+----
+
+Then you can use the Mutex Locking in your code:
+
+[source,java]
+----
+@Component
+public class SomeStorageImpl implements SomeStorage
+{
+    @Read
+    public String getSomethingById(Integer Id)
+    {
+        // Read something from the storage
+    }
+
+    @Write
+    public void addSomething(String something)
+    {
+        // Modify the object graph AND store — both inside the @Write method
+        this.root.getSomethings().add(something);
+        this.storageManager.store(this.root.getSomethings());
+    }
+}
+----
+
+If you have larger object graph, you can consider to add more Mutexes and lock different parts of the object graph. This can be done by adding the `@Mutex` annotation to the class. The parameter of this annotation is the name of the mutex. If you have multiple classes with the same mutex name, they will be locked together.
+
+[source,java]
+----
+@Component
+@Mutex("jokes")
+public class JokesStorageImpl implements JokesStorage
+{
+}
+----
+
+[CAUTION]
+====
+* *No lock upgrade:* a `@Read` method calling a `@Write` method guarded by the same lock deadlocks itself (`ReentrantReadWriteLock` cannot upgrade read to write).
+* Without `@Mutex`, *all* `@Read`/`@Write` methods in the application share one global lock — assign distinct `@Mutex` names for independent storages or subsystems.
+* With JDK interface proxies (`spring.aop.proxy-target-class=false`), a `@Mutex` present only on the implementation is not found and the global lock is used silently — annotate the interface, or keep the default class-based proxies.
+* Self-invocation (`this.someWriteMethod()`) bypasses the proxy and acquires no lock.
+====
+
+== Logging
+
+{product-name} Spring module supports standard Spring logging, so you can add this into your config:
+`logging.level.org.eclipse.store=debug`
+to obtain all {product-name} configuration keys:
+
+[source, log]
+----
+15:57:34.923 [main] DEBUG o.e.s.i.s.b.t.EclipseStoreProviderImpl -- EclipseStore configuration items:
+15:57:34.923 [main] DEBUG o.e.s.i.s.b.t.EclipseStoreProviderImpl -- storage-directory : jokes_storage
+15:57:34.923 [main] DEBUG o.e.s.i.s.b.t.EclipseStoreProviderImpl -- channel-count : 2
+15:57:34.923 [main] DEBUG o.e.s.i.s.b.t.EclipseStoreProviderImpl -- auto-start : true
+----
+
+Key values containing "password" are replaced by "xxxxx".
+
+== Register JDK 17 and JDK 8 Handlers
+
+Handler for JDK 17 are registered automatically.
+Handler for JDK 8 are not registered automatically, because of the backwards compatibility. If you create a new storage you can enable these handlers. If you have an existing storage created with JDK8 handlers, you have to active it too.
+If you need to register JDK 8 handlers, you can do it by adding the following code to your configuration:
+
+[source,properties]
+----
+org.eclipse.store.register-jdk8-handlers=true
+----
+
+== Activating REST Service SpringBoot
+
+If you are interested in using the {product-name} REST service in your application, consider to include the SpringBoot REST Service.
+Detailed documentation can be found at xref:storage:rest-interface/setup.adoc[Setup of Spring Boot REST Service].
+
+== Activating Client GUI
+
+You can include the Client GUI application to be directly as a module served by your application. For this purpose, include
+the SpringBoot Console to your application classpath. We assume that you are starting Spring MVC in your application already.
+
+Please add the following dependency to Maven pom.xml of your SpringBoot application:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.eclipse.store</groupId>
+    <artifactId>integrations-spring-boot3-console</artifactId>
+    <version>{maven-version}</version>
+</dependency>
+----
+
+In order to operate properly, Client GUI requires a working SpringBoot REST Service. This is already prepackaged in the
+console module and needs to be activated. In addition, the path to the Client GUI needs to be configured.
+
+Please set the following properties in your configuration file:
+
+[source,properties]
+----
+org.eclipse.store.rest.enabled=true
+vaadin.url-mapping=/store-console/*
+----
+
+The Client GUI will start with your application and will be available at the specified URL. So if your SpringBoot application
+starts a web server on port `8080` the Client GUI will be available at: http://localhost:8080/store-console/. Open this URL
+in your browser, select from the dropdown list the endpoint of the Spring REST Service (http://localhost:8080/store-data/)
+and click connect.
+
+
+== Spring Dev Tools
+
+If you are using Spring Dev Tools, it is recommended to exclude the {product-name} classes from the classpath. Spring Dev Tools use their own restart classloader, which dynamically reloads classes. This can cause issues with the {product-name} classes, as they are not designed to be reloaded on the fly.
+
+Spring documentation: https://docs.spring.io/spring-boot/reference/using/devtools.html
+
+== Code Configuration Before Storage Creation
+
+There are some use cases where it is necessary to configure the storage's context before it is created. For this purpose, you can use the `StorageContextInitializer` to create a custom storage configuration in your application.
+
+Example for configuring `LazyReferenceManager`:
+
+[source,java]
+----
+@Component
+public class StorageContextInitializerImpl implements StorageContextInitializer
+{
+    @Override
+    public void initialize()
+    {
+        LazyReferenceManager.set(LazyReferenceManager.New(
+                Lazy.Checker(
+                        1_000_000, // timeout of lazy access
+                        0.75       // memory quota
+                )));
+    }
+}
+----

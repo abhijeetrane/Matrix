@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<classpath>
+	<classpathentry kind="src" path="src"/>
+	<classpathentry kind="lib" path="lib/rfly.jar"/>
+	<classpathentry kind="lib" path="lib/am-2003-06-20.jar"/>
+	<classpathentry kind="lib" path="lib/jl020.jar"/>
+	<classpathentry kind="lib" path="lib/jroll.jar"/>
+	<classpathentry kind="lib" path="lib/space.jar"/>
+	<classpathentry kind="lib" path="lib/tritonus_gsm.jar"/>
+	<classpathentry kind="lib" path="lib/tritonus_remaining.jar"/>
+	<classpathentry kind="lib" path="lib/tritonus_share.jar"/>
+	<classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-21">
+		<attributes>
+			<attribute name="module" value="true"/>
+		</attributes>
+	</classpathentry>
+	<classpathentry kind="output" path="bin"/>
+</classpath>

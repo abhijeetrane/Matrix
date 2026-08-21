@@ -1,0 +1,2506 @@
+/*
+    Domain communications for Xen Store Daemon.
+    Copyright (C) 2005 Rusty Russell IBM Corporation
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <assert.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <time.h>
+#include <syslog.h>
+
+#include "utils.h"
+#include "talloc.h"
+#include "core.h"
+#include "domain.h"
+#include "transaction.h"
+#include "watch.h"
+#include "control.h"
+#include "lu.h"
+
+#include <xenevtchn.h>
+#include <xenmanage.h>
+#include <xen-barrier.h>
+#include <xen/grant_table.h>
+
+#ifdef __MINIOS__
+#include <mini-os/xenbus.h>
+#endif
+
+#define XENSTORE_FEATURES	(XENSTORE_SERVER_FEATURE_ERROR |	\
+				 XENSTORE_SERVER_FEATURE_WATCHDEPTH |	\
+				 XENSTORE_SERVER_FEATURE_DOMID_ANY)
+
+static xenmanage_handle *xm_handle;
+xengnttab_handle **xgt_handle;
+static evtchn_port_t virq_port;
+
+xenevtchn_handle *xce_handle = NULL;
+
+struct quotaadm quota_adm[ACC_N] = {
+	[ACC_NODES] = {
+		.name = "nodes",
+		.descr = "Nodes per domain",
+	},
+	[ACC_WATCH] = {
+		.name = "watches",
+		.descr = "Watches per domain",
+	},
+	[ACC_OUTST] = {
+		.name = "outstanding",
+		.descr = "Outstanding requests per domain",
+	},
+	[ACC_MEM] = {
+		.name = "memory",
+		.descr = "Total Xenstore memory per domain",
+	},
+	[ACC_TRANS] = {
+		.name = "transactions",
+		.descr = "Active transactions per domain",
+	},
+	[ACC_TRANSNODES] = {
+		.name = "transaction-nodes",
+		.descr = "Max. number of accessed nodes per transaction",
+	},
+	[ACC_NPERM] = {
+		.name = "node-permissions",
+		.descr = "Max. number of permissions per node",
+	},
+	[ACC_PATHLEN] = {
+		.name = "path-max",
+		.descr = "Max. length of a node path",
+	},
+	[ACC_NODESZ] = {
+		.name = "node-size",
+		.descr = "Max. size of a node",
+	},
+};
+
+struct quota quotas[ACC_N] = {
+	[ACC_NODES] =      { .val = { 1000, Q_VAL_DISABLED }, },
+	[ACC_WATCH] =      { .val = {  128, Q_VAL_DISABLED }, },
+	[ACC_OUTST] =      { .val = {   20, Q_VAL_DISABLED }, },
+	[ACC_MEM] =        {
+		.val = { 2 * 1024 * 1024 + 512 * 1024,	/* 2.5 MB */
+			 2 * 1024 * 1024		/* 2.0 MB */ },
+	},
+	[ACC_TRANS] =      { .val = {   10, Q_VAL_DISABLED }, },
+	[ACC_TRANSNODES] = { .val = { 1024, Q_VAL_DISABLED }, },
+	[ACC_NPERM] =      { .val = {    5, Q_VAL_DISABLED }, },
+	[ACC_PATHLEN] =    {
+		.val = { XENSTORE_REL_PATH_MAX, Q_VAL_DISABLED },
+	},
+	[ACC_NODESZ] =     { .val = { 2048, Q_VAL_DISABLED }, },
+};
+
+#define SOFT_PREFIX	"soft-"
+#define SOFT_PREFIX_LEN	(sizeof(SOFT_PREFIX) - 1)
+
+typedef int32_t wrl_creditt;
+
+struct domain
+{
+	/* The id of this domain */
+	unsigned int domid;
+	uint64_t unique_id;
+
+	/* Event channel port */
+	evtchn_port_t port;
+
+	/* Server features supported for this domain. */
+	unsigned int features;
+
+	/* Domain path in store. */
+	char *path;
+
+	/* Shared page. */
+	struct xenstore_domain_interface *interface;
+
+	/* The connection associated with this. */
+	struct connection *conn;
+
+	/* Generation count at domain introduction time. */
+	uint64_t generation;
+
+	/* Have we noticed that this domain is shutdown? */
+	bool shutdown;
+
+	/* Has domain been officially introduced? */
+	bool introduced;
+
+	/* Accounting data for this domain. */
+	unsigned int acc_val[ACC_N];
+	struct quota acc[ACC_N];
+
+	/* Memory quota data for this domain. */
+	bool soft_quota_reported;
+	bool hard_quota_reported;
+	time_t mem_last_msg;
+#define MEM_WARN_MINTIME_SEC 10
+
+	/* write rate limit */
+	wrl_creditt wrl_credit; /* [ -wrl_config_writecost, +_dburst ] */
+	uint64_t wrl_timestamp;
+	bool wrl_delay_logged;
+};
+
+struct changed_domain
+{
+	/* List of all changed domains. */
+	struct list_head list;
+
+	/* Identifier of the changed domain. */
+	unsigned int domid;
+
+	/* Accounting data. */
+	int acc[ACC_CHD_N];
+};
+
+static struct hashtable *domhash;
+
+/* Write rate limiting */
+
+/* Satisfies non-overflow condition for wrl_xfer_credit. */
+#define WRL_CREDIT_MAX (1000*1000*1000)
+#define WRL_FACTOR     1000 /* for fixed-point arithmetic */
+#define WRL_RATE        200
+#define WRL_DBURST       10
+#define WRL_GBURST     1000
+#define WRL_NEWDOMS       5
+#define WRL_LOGEVERY    120 /* seconds */
+
+static wrl_creditt wrl_config_writecost      = WRL_FACTOR;
+static wrl_creditt wrl_config_rate           = WRL_RATE   * WRL_FACTOR;
+static wrl_creditt wrl_config_dburst         = WRL_DBURST * WRL_FACTOR;
+static wrl_creditt wrl_config_gburst         = WRL_GBURST * WRL_FACTOR;
+static wrl_creditt wrl_config_newdoms_dburst =
+	                         WRL_DBURST * WRL_NEWDOMS * WRL_FACTOR;
+
+long wrl_ntransactions;
+
+static long wrl_ndomains;
+static wrl_creditt wrl_reserve; /* [-wrl_config_newdoms_dburst, +_gburst ] */
+static time_t wrl_log_last_warning; /* 0: no previous warning */
+
+#define trace_wrl(...)				\
+do {						\
+	if (trace_flags & TRACE_WRL)		\
+		trace("wrl: " __VA_ARGS__);	\
+} while (0)
+
+static void wrl_xfer_credit(wrl_creditt *debit,  wrl_creditt debit_floor,
+			    wrl_creditt *credit, wrl_creditt credit_ceil)
+	/*
+	 * Transfers zero or more credit from "debit" to "credit".
+	 * Transfers as much as possible while maintaining
+	 * debit >= debit_floor and credit <= credit_ceil.
+	 * (If that's violated already, does nothing.)
+	 *
+	 * Sufficient conditions to avoid overflow, either of:
+	 *  |every argument| <= 0x3fffffff
+	 *  |every argument| <= 1E9
+	 *  |every argument| <= WRL_CREDIT_MAX
+	 * (And this condition is preserved.)
+	 */
+{
+	wrl_creditt xfer = MIN( *debit      - debit_floor,
+			        credit_ceil - *credit      );
+	if (xfer > 0) {
+		*debit -= xfer;
+		*credit += xfer;
+	}
+}
+
+static void wrl_domain_new(struct domain *domain)
+{
+	domain->wrl_credit = 0;
+	domain->wrl_timestamp = get_now_msec();
+	wrl_ndomains++;
+	/* Steal up to DBURST from the reserve */
+	wrl_xfer_credit(&wrl_reserve, -wrl_config_newdoms_dburst,
+			&domain->wrl_credit, wrl_config_dburst);
+}
+
+static void wrl_domain_destroy(struct domain *domain)
+{
+	wrl_ndomains--;
+	/*
+	 * Don't bother recalculating domain's credit - this just
+	 * means we don't give the reserve the ending domain's credit
+	 * for time elapsed since last update.
+	 */
+	wrl_xfer_credit(&domain->wrl_credit, 0,
+			&wrl_reserve, wrl_config_dburst);
+}
+
+static void wrl_credit_update(struct domain *domain, uint64_t now)
+{
+	/*
+	 * We want to calculate
+	 *    credit += (now - timestamp) * RATE / ndoms;
+	 * But we want it to saturate, and to avoid floating point.
+	 * To avoid rounding errors from constantly adding small
+	 * amounts of credit, we only add credit for whole milliseconds.
+	 */
+	long msec;
+	int64_t denom, num;
+	wrl_creditt surplus;
+
+	/* Prevent overflow by limiting to 32 bits. */
+	msec = MIN(now - domain->wrl_timestamp, 1000 * 1000 * 1000);
+
+	/* 32x32 -> 64 cannot overflow */
+	denom = (int64_t)msec * wrl_config_rate;
+	num  =  (int64_t)wrl_ndomains * 1000;
+	/* denom / num <= 1E6 * wrl_config_rate, so with
+	   reasonable wrl_config_rate, denom / num << 2^64 */
+
+	/* at last! */
+	domain->wrl_credit = MIN( (int64_t)domain->wrl_credit + denom / num,
+				  WRL_CREDIT_MAX );
+	/* (maybe briefly violating the DBURST cap on wrl_credit) */
+
+	/* maybe take from the reserve to make us nonnegative */
+	wrl_xfer_credit(&wrl_reserve,        0,
+			&domain->wrl_credit, 0);
+
+	/* return any surplus (over DBURST) to the reserve */
+	surplus = 0;
+	wrl_xfer_credit(&domain->wrl_credit, wrl_config_dburst,
+			&surplus,            WRL_CREDIT_MAX);
+	wrl_xfer_credit(&surplus,     0,
+			&wrl_reserve, wrl_config_gburst);
+	/* surplus is now implicitly discarded */
+
+	domain->wrl_timestamp = now;
+
+	trace_wrl("dom %4d %6ld msec %9ld credit  %9ld reserve %9ld discard\n",
+		  domain->domid, msec, (long)domain->wrl_credit,
+		  (long)wrl_reserve, (long)surplus);
+}
+
+void wrl_check_timeout(struct domain *domain, uint64_t now, int *ptimeout)
+{
+	uint64_t num, denom;
+	int wakeup;
+
+	wrl_credit_update(domain, now);
+
+	if (domain->wrl_credit >= 0)
+		/* not blocked */
+		return;
+
+	if (!*ptimeout)
+		/* already decided on immediate wakeup,
+		   so no need to calculate our timeout */
+		return;
+
+	/* calculate  wakeup = now + -credit / (RATE / ndoms); */
+
+	/* credit cannot go more -ve than one transaction,
+	 * so the first multiplication cannot overflow even 32-bit */
+	num   = (uint64_t)(-domain->wrl_credit * 1000) * wrl_ndomains;
+	denom = wrl_config_rate;
+
+	wakeup = MIN( num / denom /* uint64_t */, INT_MAX );
+	if (*ptimeout==-1 || wakeup < *ptimeout)
+		*ptimeout = wakeup;
+
+	trace_wrl("domain %u credit=%ld (reserve=%ld) SLEEPING for %d\n",
+		  domain->domid, (long)domain->wrl_credit, (long)wrl_reserve,
+		  wakeup);
+}
+
+#define WRL_LOG(now, ...) \
+	(syslog(LOG_WARNING, "write rate limit: " __VA_ARGS__))
+
+void wrl_apply_debit_actual(struct domain *domain)
+{
+	uint64_t now;
+
+	if (!domain || !domain_is_unprivileged(domain->conn))
+		/* sockets and privileged domain escape the write rate limit */
+		return;
+
+	now = get_now_msec();
+	wrl_credit_update(domain, now);
+
+	domain->wrl_credit -= wrl_config_writecost;
+	trace_wrl("domain %u credit=%ld (reserve=%ld)\n", domain->domid,
+		  (long)domain->wrl_credit, (long)wrl_reserve);
+
+	if (domain->wrl_credit < 0) {
+		if (!domain->wrl_delay_logged) {
+			domain->wrl_delay_logged = true;
+			WRL_LOG(now, "domain %ld is affected\n",
+				(long)domain->domid);
+		} else if (!wrl_log_last_warning) {
+			WRL_LOG(now, "rate limiting restarts\n");
+		}
+		wrl_log_last_warning = now / 1000;
+	}
+}
+
+void wrl_log_periodic(uint64_t now)
+{
+	if (wrl_log_last_warning &&
+	    (now / 1000 - wrl_log_last_warning) > WRL_LOGEVERY) {
+		WRL_LOG(now, "not in force recently\n");
+		wrl_log_last_warning = 0;
+	}
+}
+
+void wrl_apply_debit_direct(struct connection *conn)
+{
+	if (!conn)
+		/* some writes are generated internally */
+		return;
+
+	if (conn->transaction)
+		/* these are accounted for when the transaction ends */
+		return;
+
+	if (!wrl_ntransactions)
+		/* we don't conflict with anyone */
+		return;
+
+	wrl_apply_debit_actual(conn->domain);
+}
+
+void wrl_apply_debit_trans_commit(struct connection *conn)
+{
+	if (wrl_ntransactions <= 1)
+		/* our own transaction appears in the counter */
+		return;
+
+	wrl_apply_debit_actual(conn->domain);
+}
+
+bool feature_available(const struct connection *conn, unsigned int feature)
+{
+	if (!conn->domain)
+		return XENSTORE_FEATURES & feature;
+
+	return conn->domain->features & feature;
+}
+
+static unsigned int domain_get_soft_quota(struct domain *d, enum accitem what)
+{
+	if (d && d->acc[what].val[Q_IDX_SOFT] != Q_VAL_DISABLED)
+		return d->acc[what].val[Q_IDX_SOFT];
+
+	return quotas[what].val[Q_IDX_SOFT];
+}
+
+static bool domain_quota_val_exceeds(struct domain *d, enum accitem what,
+				     unsigned int val)
+{
+	unsigned int quota = quotas[what].val[Q_IDX_HARD];
+
+	if (d->acc[what].val[Q_IDX_HARD] != Q_VAL_DISABLED)
+		quota = d->acc[what].val[Q_IDX_HARD];
+
+	if (!quota || !domid_is_unprivileged(d->domid))
+		return false;
+
+	return val >= quota;
+}
+
+bool domain_quota_add_exceeds(struct domain *d, enum accitem what, int add)
+{
+	if (add < 0 || !d)
+		return false;
+
+	return domain_quota_val_exceeds(d, what, d->acc_val[what] + add);
+}
+
+static bool check_indexes(XENSTORE_RING_IDX cons, XENSTORE_RING_IDX prod)
+{
+	return ((prod - cons) <= XENSTORE_RING_SIZE);
+}
+
+static void *get_output_chunk(XENSTORE_RING_IDX cons,
+			      XENSTORE_RING_IDX prod,
+			      char *buf, uint32_t *len)
+{
+	*len = XENSTORE_RING_SIZE - MASK_XENSTORE_IDX(prod);
+	if ((XENSTORE_RING_SIZE - (prod - cons)) < *len)
+		*len = XENSTORE_RING_SIZE - (prod - cons);
+	return buf + MASK_XENSTORE_IDX(prod);
+}
+
+static const void *get_input_chunk(XENSTORE_RING_IDX cons,
+				   XENSTORE_RING_IDX prod,
+				   const char *buf, uint32_t *len)
+{
+	*len = XENSTORE_RING_SIZE - MASK_XENSTORE_IDX(cons);
+	if ((prod - cons) < *len)
+		*len = prod - cons;
+	return buf + MASK_XENSTORE_IDX(cons);
+}
+
+static int writechn(struct connection *conn,
+		    const void *data, unsigned int len)
+{
+	uint32_t avail;
+	void *dest;
+	struct xenstore_domain_interface *intf = conn->domain->interface;
+	XENSTORE_RING_IDX cons, prod;
+
+	/* Must read indexes once, and before anything else, and verified. */
+	cons = intf->rsp_cons;
+	prod = intf->rsp_prod;
+	xen_mb();
+
+	if (!check_indexes(cons, prod)) {
+		errno = EIO;
+		return -1;
+	}
+
+	dest = get_output_chunk(cons, prod, intf->rsp, &avail);
+	if (avail < len)
+		len = avail;
+
+	memcpy(dest, data, len);
+	xen_mb();
+	intf->rsp_prod += len;
+
+	xenevtchn_notify(xce_handle, conn->domain->port);
+
+	return len;
+}
+
+static int readchn(struct connection *conn, void *data, unsigned int len)
+{
+	uint32_t avail;
+	const void *src;
+	struct xenstore_domain_interface *intf = conn->domain->interface;
+	XENSTORE_RING_IDX cons, prod;
+
+	/* Must read indexes once, and before anything else, and verified. */
+	cons = intf->req_cons;
+	prod = intf->req_prod;
+	xen_mb();
+
+	if (!check_indexes(cons, prod)) {
+		errno = EIO;
+		return -1;
+	}
+
+	src = get_input_chunk(cons, prod, intf->req, &avail);
+	if (avail < len)
+		len = avail;
+
+	memcpy(data, src, len);
+	xen_mb();
+	intf->req_cons += len;
+
+	xenevtchn_notify(xce_handle, conn->domain->port);
+
+	return len;
+}
+
+static bool domain_can_write(struct connection *conn)
+{
+	struct xenstore_domain_interface *intf = conn->domain->interface;
+
+	return ((intf->rsp_prod - intf->rsp_cons) != XENSTORE_RING_SIZE);
+}
+
+static bool domain_can_read(struct connection *conn)
+{
+	struct domain *domain = conn->domain;
+	struct xenstore_domain_interface *intf = domain->interface;
+
+	if (domain_is_unprivileged(conn)) {
+		if (domain->wrl_credit < 0)
+			return false;
+		if (domain_quota_add_exceeds(domain, ACC_OUTST, 0))
+			return false;
+		if (domain_quota_add_exceeds(domain, ACC_MEM, 0))
+			return false;
+	}
+
+	return (intf->req_cons != intf->req_prod);
+}
+
+static const struct interface_funcs domain_funcs = {
+	.write = writechn,
+	.read = readchn,
+	.can_write = domain_can_write,
+	.can_read = domain_can_read,
+};
+
+static void *map_interface(domid_t domid)
+{
+	if (domid == store_domid)
+		return xenbus_map();
+
+	return xengnttab_map_grant_ref(*xgt_handle, domid,
+				       GNTTAB_RESERVED_XENSTORE,
+				       PROT_READ|PROT_WRITE);
+}
+
+static void unmap_interface(domid_t domid, void *interface)
+{
+	if (domid == store_domid)
+		unmap_xenbus(interface);
+	else if (domid != stub_domid)
+		xengnttab_unmap(*xgt_handle, interface, 1);
+}
+
+static int domain_tree_remove_sub(const void *ctx, struct connection *conn,
+				  struct node *node, void *arg)
+{
+	struct domain *domain = arg;
+	bool node_changed = false;
+	unsigned int i;
+
+	if (node->perms[0].id == domain->domid && !keep_orphans) {
+		if (rm_node(NULL, ctx, node->name)) {
+			/* That's unfortunate. We only can try to continue. */
+			syslog(LOG_ERR,
+			       "error when deleting orphaned node %s\n",
+			       node->name);
+		} else
+			trace("orphaned node %s deleted\n", node->name);
+
+		/* Skip children in all cases in order to avoid more errors. */
+		return WALK_TREE_SKIP_CHILDREN;
+	}
+
+	if (node->perms[0].id == domain->domid) {
+		domain_nbentry_dec(NULL, domain->domid);
+		node->perms[0].id = priv_domid;
+		node->acc.memory = 0;
+		domain_nbentry_inc(NULL, priv_domid);
+		trace("moving orphaned node %s to dom%d\n", node->name,
+		      priv_domid);
+		node_changed = true;
+	}
+
+	for (i = 1; i < node->hdr.num_perms; i++) {
+		if (node->perms[i].id != domain->domid)
+			continue;
+		memmove(node->perms + i, node->perms + i + 1,
+			sizeof(*node->perms) * (node->hdr.num_perms - i - 1));
+		node->hdr.num_perms--;
+		i--;
+		node_changed = true;
+	}
+
+	if (node_changed) {
+		if (write_node_raw(NULL, node->name, node, NODE_MODIFY, true)) {
+			/* That's unfortunate. We only can try to continue. */
+			syslog(LOG_ERR,
+			       "error when writing modified node %s\n",
+			       node->name);
+		}
+	}
+
+	return WALK_TREE_OK;
+}
+
+static void domain_tree_remove(struct domain *domain)
+{
+	int ret;
+	struct walk_funcs walkfuncs = { .enter = domain_tree_remove_sub };
+
+	ret = walk_node_tree(domain, NULL, "/", &walkfuncs, domain);
+	if (ret == WALK_TREE_ERROR_STOP)
+		syslog(LOG_ERR, "error when looking for orphaned nodes\n");
+
+	walk_node_tree(domain, NULL, "@releaseDomain", &walkfuncs, domain);
+	walk_node_tree(domain, NULL, "@introduceDomain", &walkfuncs, domain);
+}
+
+#define WATCH_NODOM	1	/* Fire watches without <domid> extension. */
+#define WATCH_DOM	2	/* Fire watches with <domid> extension. */
+#define WATCH_BOTH	(WATCH_NODOM | WATCH_DOM)
+
+static void fire_special_watches(const char *name, unsigned int domid,
+				 unsigned int watchdom_flag)
+{
+	void *ctx = talloc_new(NULL);
+	const struct node *node;
+
+	if (!ctx)
+		return;
+
+	node = read_node_const(NULL, ctx, name);
+
+	if (node) {
+		if (watchdom_flag & WATCH_NODOM)
+			fire_watches(NULL, ctx, name, node, MATCH_NODEPTH,
+				     NULL);
+		if (watchdom_flag & WATCH_DOM) {
+			char name_dom[24]; /* max. "@introduceDomain/domid" */
+
+			snprintf(name_dom, sizeof(name_dom),
+				 "%s/%u", name, domid);
+			fire_watches(NULL, ctx, name_dom, node, MATCH_DEPTH,
+				     NULL);
+		}
+	} else
+		log("special node %s not found\n", name);
+
+	talloc_free(ctx);
+}
+
+static int destroy_domain(void *_domain)
+{
+	struct domain *domain = _domain;
+
+	domain_tree_remove(domain);
+
+	hashtable_remove(domhash, &domain->domid);
+
+	if (!domain->introduced)
+		return 0;
+
+	if (domain->port) {
+		if (xenevtchn_unbind(xce_handle, domain->port) == -1)
+			eprintf("> Unbinding port %i failed!\n", domain->port);
+	}
+
+	if (domain->interface)
+		unmap_interface(domain->domid, domain->interface);
+
+	fire_special_watches("@releaseDomain", domain->domid, WATCH_BOTH);
+
+	wrl_domain_destroy(domain);
+
+	return 0;
+}
+
+static int do_check_domain(struct domain *domain, bool *notify,
+			   unsigned int state, uint64_t unique_id)
+{
+	struct connection *conn;
+
+	if (unique_id) {
+		if (!domain->unique_id)
+			domain->unique_id = unique_id;
+		else if (domain->unique_id != unique_id)
+			unique_id = 0;
+	}
+
+	if (!domain->introduced) {
+		if (!unique_id)
+			talloc_free(domain);
+		return 0;
+	}
+	if (unique_id) {
+		if ((state & XENMANAGE_GETDOMSTATE_STATE_SHUTDOWN)
+		    && !domain->shutdown) {
+			domain->shutdown = true;
+			fire_special_watches("@releaseDomain", domain->domid,
+					     WATCH_DOM);
+			*notify = true;
+		}
+		if (!(state & XENMANAGE_GETDOMSTATE_STATE_DEAD))
+			return 0;
+	}
+	if (domain->conn) {
+		/* domain is a talloc child of domain->conn. */
+		conn = domain->conn;
+		domain->conn = NULL;
+		talloc_unlink(talloc_autofree_context(), conn);
+		*notify = false; /* destroy_domain() fires the watch */
+
+		/* Above unlink might result in 2 domains being freed! */
+		return 1;
+	}
+
+	return 0;
+}
+
+static int check_domain(const void *k, void *v, void *arg)
+{
+	struct domain *domain = v;
+	unsigned int state;
+	uint64_t unique_id;
+
+	if (xenmanage_get_domain_info(xm_handle, domain->domid, &state, NULL,
+				      &unique_id)) {
+		unique_id = 0;
+		state = 0;
+	}
+
+	return do_check_domain(domain, arg, state, unique_id);
+}
+
+void check_domains(void)
+{
+	bool notify = false;
+
+	while (hashtable_iterate(domhash, check_domain, &notify))
+		;
+
+	if (notify)
+		fire_special_watches("@releaseDomain", 0, WATCH_NODOM);
+}
+
+static struct domain *find_domain_struct(unsigned int domid)
+{
+	return hashtable_search(domhash, &domid);
+}
+
+static void do_check_domains(void)
+{
+	unsigned int domid;
+	unsigned int state;
+	uint64_t unique_id;
+	struct domain *domain;
+	bool notify = false;
+
+	while (!xenmanage_poll_changed_domain(xm_handle, &domid, &state, NULL,
+					      &unique_id)) {
+		domain = find_domain_struct(domid);
+		if (domain)
+			do_check_domain(domain, &notify, state, unique_id);
+	}
+
+	if (notify)
+		fire_special_watches("@releaseDomain", 0, WATCH_NODOM);
+}
+
+/* We scan all domains rather than use the information given here. */
+void handle_event(void)
+{
+	evtchn_port_t port;
+
+	if ((port = xenevtchn_pending(xce_handle)) == -1)
+		barf_perror("Failed to read from event fd");
+
+	if (port == virq_port)
+		do_check_domains();
+
+	if (xenevtchn_unmask(xce_handle, port) == -1)
+		barf_perror("Failed to write to event fd");
+}
+
+static char *talloc_domain_path(const void *context, unsigned int domid)
+{
+	return talloc_asprintf(context, "/local/domain/%u", domid);
+}
+
+/* Parse a domid. Sets errno either to 0 or EINVAL. */
+static unsigned int parse_domid(const char *input)
+{
+	unsigned long domid;
+	char *endptr;
+
+	domid = strtoul(input, &endptr, 10);
+	errno = (*endptr != 0 || domid > 65535) ? EINVAL : 0;
+
+	return domid;
+}
+
+int domain_get_quota(const void *ctx, struct connection *conn,
+		     unsigned int domid)
+{
+	struct domain *d = find_domain_struct(domid);
+	char *resp;
+	unsigned int i;
+
+	if (!d)
+		return ENOENT;
+
+	resp = talloc_asprintf(ctx, "Domain %u:\n", domid);
+	if (!resp)
+		return ENOMEM;
+
+	for (i = 0; i < ACC_N; i++) {
+		if (!quota_adm[i].name)
+			continue;
+		resp = talloc_asprintf_append(resp, "%-17s: %8u (max %8u)\n",
+					      quota_adm[i].name,
+					      d->acc_val[i], d->acc[i].max);
+		if (!resp)
+			return ENOMEM;
+	}
+
+	send_reply(conn, XS_CONTROL, resp, strlen(resp) + 1);
+
+	return 0;
+}
+
+int domain_max_global_acc(const void *ctx, struct connection *conn)
+{
+	char *resp;
+	unsigned int i;
+
+	resp = talloc_asprintf(ctx, "Max. seen accounting values:\n");
+	if (!resp)
+		return ENOMEM;
+
+	for (i = 0; i < ACC_N; i++) {
+		if (!quota_adm[i].name)
+			continue;
+		resp = talloc_asprintf_append(resp, "%-17s: %8u\n",
+					      quota_adm[i].name, quotas[i].max);
+		if (!resp)
+			return ENOMEM;
+	}
+
+	send_reply(conn, XS_CONTROL, resp, strlen(resp) + 1);
+
+	return 0;
+}
+
+static struct domain *alloc_domain(const void *context, unsigned int domid,
+				   uint64_t unique_id)
+{
+	struct domain *domain;
+	unsigned int q;
+
+	domain = talloc_zero(context, struct domain);
+	if (!domain) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	domain->domid = domid;
+	domain->unique_id = unique_id;
+	domain->generation = generation;
+	domain->introduced = false;
+	domain->features = XENSTORE_FEATURES;
+
+	for (q = 0; q < ACC_N; q++) {
+		domain->acc[q].val[Q_IDX_HARD] = quotas[q].val[Q_IDX_HARD];
+		domain->acc[q].val[Q_IDX_SOFT] = quotas[q].val[Q_IDX_SOFT];
+	}
+
+	if (hashtable_add(domhash, &domain->domid, domain)) {
+		talloc_free(domain);
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	talloc_set_destructor(domain, destroy_domain);
+
+	return domain;
+}
+
+static struct domain *find_or_alloc_domain(const void *ctx, unsigned int domid)
+{
+	struct domain *domain;
+
+	domain = find_domain_struct(domid);
+	/* If domain not already known, use unique_id = 0 meaning "unknown". */
+	return domain ? : alloc_domain(ctx, domid, 0);
+}
+
+static struct domain *find_or_alloc_existing_domain(unsigned int domid)
+{
+	struct domain *domain;
+	uint64_t unique_id = 0;
+	bool dom_valid = true;
+
+	domain = find_domain_struct(domid);
+	if (!domain || !domain->unique_id)
+		dom_valid = !xenmanage_get_domain_info(xm_handle, domid,
+						       NULL, NULL, &unique_id);
+
+	if (dom_valid) {
+		if (!domain)
+			domain = alloc_domain(NULL, domid, unique_id);
+		else if (unique_id)
+			domain->unique_id = unique_id;
+	}
+
+	return domain;
+}
+
+static int new_domain(struct domain *domain, int port, bool restore)
+{
+	int rc;
+
+	domain->port = 0;
+	domain->shutdown = false;
+	domain->path = talloc_domain_path(domain, domain->domid);
+	if (!domain->path) {
+		errno = ENOMEM;
+		return errno;
+	}
+
+	wrl_domain_new(domain);
+
+	if (restore) {
+		if (evtchn_rebind(port)) {
+			errno = ENOMEM;
+			return errno;
+		}
+		domain->port = port;
+	} else {
+		/* Tell kernel we're interested in this event. */
+		rc = xenevtchn_bind_interdomain(xce_handle, domain->domid,
+						port);
+		if (rc == -1)
+			return errno;
+		domain->port = rc;
+	}
+
+	domain->introduced = true;
+
+	domain->conn = new_connection(&domain_funcs);
+	if (!domain->conn)  {
+		errno = ENOMEM;
+		return errno;
+	}
+
+	domain->conn->domain = domain;
+	domain->conn->id = domain->domid;
+
+	return 0;
+}
+
+
+static struct domain *find_domain_by_domid(unsigned int domid)
+{
+	struct domain *d;
+
+	d = find_domain_struct(domid);
+
+	return (d && d->introduced) ? d : NULL;
+}
+
+#define trace_acc(...)				\
+do {						\
+	if (trace_flags & TRACE_ACC)		\
+		trace("acc: " __VA_ARGS__);	\
+} while (0)
+
+int acc_fix_domains(struct list_head *head, bool chk_quota, bool update)
+{
+	struct domain *d;
+	struct changed_domain *cd;
+
+	list_for_each_entry(cd, head, list) {
+		if (update) {
+			domain_nbentry_fix(cd->domid, cd->acc[ACC_NODES]);
+		} else if (chk_quota) {
+			d = find_or_alloc_existing_domain(cd->domid);
+
+			if (!d)
+				return ENOMEM;
+			if (domain_quota_add_exceeds(d, ACC_NODES,
+						     cd->acc[ACC_NODES]))
+				return ENOSPC;
+		}
+	}
+
+	return 0;
+}
+
+static struct changed_domain *acc_find_changed_domain(struct list_head *head,
+						      unsigned int domid)
+{
+	struct changed_domain *cd;
+
+	list_for_each_entry(cd, head, list) {
+		if (cd->domid == domid)
+			return cd;
+	}
+
+	return NULL;
+}
+
+static struct changed_domain *acc_get_changed_domain(const void *ctx,
+						     struct list_head *head,
+						     unsigned int domid)
+{
+	struct changed_domain *cd;
+
+	cd = acc_find_changed_domain(head, domid);
+	if (cd)
+		return cd;
+
+	cd = talloc_zero(ctx, struct changed_domain);
+	if (!cd)
+		return NULL;
+
+	cd->domid = domid;
+	list_add_tail(&cd->list, head);
+
+	return cd;
+}
+
+static int acc_add_changed_dom(const void *ctx, struct list_head *head,
+			       enum accitem what, int val, unsigned int domid)
+{
+	struct changed_domain *cd;
+
+	assert(what < ARRAY_SIZE(cd->acc));
+
+	cd = acc_get_changed_domain(ctx, head, domid);
+	if (!cd)
+		return 0;
+
+	errno = 0;
+	trace_acc("local change domid %u: what=%u %d add %d\n", domid, what,
+		  cd->acc[what], val);
+	cd->acc[what] += val;
+
+	return cd->acc[what];
+}
+
+static void domain_conn_reset(struct domain *domain)
+{
+	struct connection *conn = domain->conn;
+
+	conn_delete_all_watches(conn);
+	conn_delete_all_transactions(conn);
+	conn_free_buffered_data(conn);
+
+	talloc_free(conn->in);
+
+	domain->interface->req_cons = domain->interface->req_prod = 0;
+	domain->interface->rsp_cons = domain->interface->rsp_prod = 0;
+	xen_wmb();
+}
+
+/*
+ * Keep the connection alive but stop processing any new request or sending
+ * reponse. This is to allow sending @releaseDomain watch event at the correct
+ * moment and/or to allow the connection to restart (not yet implemented).
+ *
+ * All watches, transactions, buffers will be freed.
+ */
+void ignore_connection(struct connection *conn, unsigned int err)
+{
+	trace("CONN %p ignored, reason %u\n", conn, err);
+
+	if (conn->domain && conn->domain->interface &&
+	    (conn->domain->features & XENSTORE_SERVER_FEATURE_ERROR))
+		conn->domain->interface->error = err;
+
+	conn->is_ignored = true;
+	conn_delete_all_watches(conn);
+	conn_delete_all_transactions(conn);
+	conn_free_buffered_data(conn);
+
+	talloc_free(conn->in);
+	conn->in = NULL;
+	/* if this is a socket connection, drop it now */
+	if (conn->fd >= 0)
+		talloc_free(conn);
+}
+
+static struct domain *introduce_domain(const void *ctx,
+				       unsigned int domid,
+				       evtchn_port_t port, bool restore)
+{
+	struct domain *domain;
+	int rc;
+	struct xenstore_domain_interface *interface;
+	bool is_priv_domain = (domid == priv_domid);
+
+	domain = find_or_alloc_domain(ctx, domid);
+	if (!domain)
+		return NULL;
+
+	if (!domain->introduced) {
+		interface = map_interface(domid);
+		if (!interface && !restore)
+			return NULL;
+
+		if (!restore && interface->evtchn_port)
+			port = interface->evtchn_port;
+
+		if (new_domain(domain, port, restore)) {
+			rc = errno;
+			if (interface)
+				unmap_interface(domid, interface);
+			errno = rc;
+			return NULL;
+		}
+		domain->interface = interface;
+		if (!restore)
+			interface->server_features = domain->features;
+
+		if (is_priv_domain)
+			setup_structure(restore);
+
+		/* Now domain belongs to its connection. */
+		talloc_steal(domain->conn, domain);
+
+		if (!is_priv_domain && !restore)
+			fire_special_watches("@introduceDomain", domid,
+					     WATCH_BOTH);
+	} else {
+		/* Use XS_INTRODUCE for recreating the xenbus event-channel. */
+		if (domain->port)
+			xenevtchn_unbind(xce_handle, domain->port);
+		rc = xenevtchn_bind_interdomain(xce_handle, domid, port);
+		domain->port = (rc == -1) ? 0 : rc;
+	}
+
+	return domain;
+}
+
+/* domid, gfn, evtchn, path */
+int do_introduce(const void *ctx, struct connection *conn,
+		 struct buffered_data *in)
+{
+	struct domain *domain;
+	const char *vec[3];
+	unsigned int domid;
+	evtchn_port_t port;
+
+	if (get_strings(in, vec, ARRAY_SIZE(vec)) < ARRAY_SIZE(vec))
+		return EINVAL;
+
+	domid = parse_domid(vec[0]);
+	if (errno)
+		return errno;
+
+	/* Ignore the gfn, we don't need it. */
+	port = atoi(vec[2]);
+
+	/* Sanity check args. */
+	if (port <= 0)
+		return EINVAL;
+
+	domain = introduce_domain(ctx, domid, port, false);
+	if (!domain)
+		return errno;
+
+	domain_conn_reset(domain);
+
+	if (domain->interface != NULL &&
+	    domain->interface->connection == XENSTORE_RECONNECT) {
+		/* Notify the domain that xenstore is available */
+		domain->interface->connection = XENSTORE_CONNECTED;
+		xenevtchn_notify(xce_handle, domain->port);
+	}
+
+	send_ack(conn, XS_INTRODUCE);
+
+	return 0;
+}
+
+static struct domain *find_connected_domain(unsigned int domid)
+{
+	struct domain *domain;
+
+	domain = find_domain_by_domid(domid);
+	if (!domain)
+		return ERR_PTR(-ENOENT);
+	if (!domain->conn)
+		return ERR_PTR(-EINVAL);
+	return domain;
+}
+
+int do_set_target(const void *ctx, struct connection *conn,
+		  struct buffered_data *in)
+{
+	const char *vec[2];
+	unsigned int domid, tdomid;
+        struct domain *domain, *tdomain;
+	if (get_strings(in, vec, ARRAY_SIZE(vec)) < ARRAY_SIZE(vec))
+		return EINVAL;
+
+	domid = parse_domid(vec[0]);
+	if (errno)
+		return errno;
+	tdomid = parse_domid(vec[1]);
+	if (errno)
+		return errno;
+
+        domain = find_connected_domain(domid);
+	if (IS_ERR(domain))
+		return -PTR_ERR(domain);
+
+        tdomain = find_connected_domain(tdomid);
+	if (IS_ERR(tdomain))
+		return -PTR_ERR(tdomain);
+
+        talloc_reference(domain->conn, tdomain->conn);
+        domain->conn->target = tdomain->conn;
+
+	send_ack(conn, XS_SET_TARGET);
+
+	return 0;
+}
+
+static struct domain *onearg_domain(struct connection *conn,
+				    struct buffered_data *in)
+{
+	const char *domid_str = onearg(in);
+	unsigned int domid;
+
+	if (!domid_str)
+		return ERR_PTR(-EINVAL);
+
+	domid = parse_domid(domid_str);
+	if (errno)
+		return ERR_PTR(-errno);
+	if (domid == store_domid || domid == priv_domid)
+		return ERR_PTR(-EINVAL);
+
+	return find_connected_domain(domid);
+}
+
+/* domid */
+int do_release(const void *ctx, struct connection *conn,
+	       struct buffered_data *in)
+{
+	struct domain *domain;
+
+	domain = onearg_domain(conn, in);
+	if (IS_ERR(domain))
+		return -PTR_ERR(domain);
+
+	/* Avoid triggering watch events when the domain's nodes are deleted. */
+	conn_delete_all_watches(domain->conn);
+
+	talloc_free(domain->conn);
+
+	send_ack(conn, XS_RELEASE);
+
+	return 0;
+}
+
+int do_resume(const void *ctx, struct connection *conn,
+	      struct buffered_data *in)
+{
+	struct domain *domain;
+
+	domain = onearg_domain(conn, in);
+	if (IS_ERR(domain))
+		return -PTR_ERR(domain);
+
+	domain->shutdown = false;
+
+	send_ack(conn, XS_RESUME);
+
+	return 0;
+}
+
+int do_get_domain_path(const void *ctx, struct connection *conn,
+		       struct buffered_data *in)
+{
+	char *path;
+	const char *domid_str = onearg(in);
+	unsigned int domid;
+
+	if (!domid_str)
+		return EINVAL;
+
+	domid = parse_domid(domid_str);
+	if (errno)
+		return errno;
+	path = talloc_domain_path(ctx, domid);
+	if (!path)
+		return errno;
+
+	send_reply(conn, XS_GET_DOMAIN_PATH, path, strlen(path) + 1);
+
+	return 0;
+}
+
+int do_is_domain_introduced(const void *ctx, struct connection *conn,
+			    struct buffered_data *in)
+{
+	int result;
+	unsigned int domid;
+	const char *domid_str = onearg(in);
+
+	if (!domid_str)
+		return EINVAL;
+
+	domid = parse_domid(domid_str);
+	if (errno)
+		return errno;
+	if (domid == DOMID_SELF)
+		result = 1;
+	else
+		result = (find_domain_by_domid(domid) != NULL);
+
+	send_reply(conn, XS_IS_DOMAIN_INTRODUCED, result ? "T" : "F", 2);
+
+	return 0;
+}
+
+/* Allow guest to reset all watches */
+int do_reset_watches(const void *ctx, struct connection *conn,
+		     struct buffered_data *in)
+{
+	conn_delete_all_watches(conn);
+	conn_delete_all_transactions(conn);
+
+	send_ack(conn, XS_RESET_WATCHES);
+
+	return 0;
+}
+
+int do_get_feature(const void *ctx, struct connection *conn,
+		   struct buffered_data *in)
+{
+	const char *vec[1];
+	unsigned int n_args;
+	unsigned int domid;
+	const struct domain *domain;
+	unsigned int features;
+	char *result;
+
+	n_args = get_strings(in, vec, ARRAY_SIZE(vec));
+
+	if (!n_args) {
+		features = conn->domain ? conn->domain->features
+					: XENSTORE_FEATURES;
+	} else {
+		if (domain_is_unprivileged(conn))
+			return EACCES;
+
+		if (n_args > 1)
+			return EINVAL;
+
+		domid = parse_domid(vec[0]);
+		if (errno)
+			return errno;
+		domain = find_or_alloc_existing_domain(domid);
+		if (!domain)
+			return ENOENT;
+		features = domain->features;
+	}
+
+	result = talloc_asprintf(ctx, "%u", features);
+	if (!result)
+		return ENOMEM;
+
+	send_reply(conn, XS_GET_FEATURE, result, strlen(result) + 1);
+
+	return 0;
+}
+
+int do_set_feature(const void *ctx, struct connection *conn,
+		   struct buffered_data *in)
+{
+	const char *vec[2];
+	unsigned int domid;
+	struct domain *domain;
+	unsigned int features;
+
+	if (get_strings(in, vec, ARRAY_SIZE(vec)) != ARRAY_SIZE(vec))
+		return EINVAL;
+
+	domid = parse_domid(vec[0]);
+	if (errno)
+		return errno;
+	features = atoi(vec[1]);
+	domain = find_or_alloc_existing_domain(domid);
+	if (!domain)
+		return ENOENT;
+	if (domain->introduced)
+		return EBUSY;
+	if (features & ~XENSTORE_FEATURES)
+		return EINVAL;
+
+	domain->features = features;
+
+	send_ack(conn, XS_SET_FEATURE);
+
+	return 0;
+}
+
+static bool parse_quota_name(const char *name, unsigned int *qidx,
+			     unsigned int *idx)
+{
+	unsigned int q;
+
+	if (strncmp(name, SOFT_PREFIX, SOFT_PREFIX_LEN)) {
+		*idx = Q_IDX_HARD;
+	} else {
+		*idx = Q_IDX_SOFT;
+		name += SOFT_PREFIX_LEN;
+	}
+	for (q = 0; q < ACC_N; q++) {
+		if (quota_adm[q].name && !strcmp(quota_adm[q].name, name)) {
+			if (quotas[q].val[*idx] == Q_VAL_DISABLED)
+				return true;
+			*qidx = q;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+int do_get_quota(const void *ctx, struct connection *conn,
+		 struct buffered_data *in)
+{
+	const char *vec[2];
+	unsigned int n_pars;
+	unsigned int domid;
+	unsigned int q;
+	unsigned int idx;
+	char *resp;
+	const char *name;
+	const struct quota *quota;
+	const struct domain *domain;
+
+	n_pars = get_strings(in, vec, ARRAY_SIZE(vec));
+
+	if (n_pars > 2)
+		return EINVAL;
+
+	if (n_pars == 0) {
+		resp = talloc_strdup(ctx, "");
+		if (!resp)
+			return ENOMEM;
+		for (q = 0; q < ACC_N; q++) {
+			if (!quota_adm[q].name)
+				continue;
+			if (quotas[q].val[Q_IDX_HARD] != Q_VAL_DISABLED) {
+				resp = talloc_asprintf_append(resp, "%s%s",
+					*resp ? " " : "", quota_adm[q].name);
+				if (!resp)
+					return ENOMEM;
+			}
+			if (quotas[q].val[Q_IDX_SOFT] != Q_VAL_DISABLED) {
+				resp = talloc_asprintf_append(resp, "%s%s%s",
+					*resp ? " " : "", SOFT_PREFIX,
+					quota_adm[q].name);
+				if (!resp)
+					return ENOMEM;
+			}
+		}
+	} else {
+		if (n_pars == 1) {
+			quota = quotas;
+			name = vec[0];
+		} else {
+			domid = parse_domid(vec[0]);
+			if (errno)
+				return errno;
+			domain = find_or_alloc_existing_domain(domid);
+			if (!domain)
+				return ENOENT;
+			quota = domain->acc;
+			name = vec[1];
+		}
+
+		if (parse_quota_name(name, &q, &idx))
+			return EINVAL;
+
+		resp = talloc_asprintf(ctx, "%u", quota[q].val[idx]);
+		if (!resp)
+			return ENOMEM;
+	}
+
+	send_reply(conn, XS_GET_QUOTA, resp, strlen(resp) + 1);
+
+	return 0;
+}
+
+int do_set_quota(const void *ctx, struct connection *conn,
+		 struct buffered_data *in)
+{
+	const char *vec[3];
+	unsigned int n_pars;
+	unsigned int domid;
+	unsigned int q;
+	unsigned int idx;
+	const char *name;
+	unsigned int val;
+	struct quota *quota;
+	struct domain *domain;
+
+	n_pars = get_strings(in, vec, ARRAY_SIZE(vec));
+
+	if (n_pars < 2 || n_pars > 3)
+		return EINVAL;
+
+	if (n_pars == 2) {
+		quota = quotas;
+		name = vec[0];
+		val = atoi(vec[1]);
+	} else {
+		domid = parse_domid(vec[0]);
+		if (errno)
+			return errno;
+		domain = find_or_alloc_existing_domain(domid);
+		if (!domain)
+			return ENOENT;
+		quota = domain->acc;
+		name = vec[1];
+		val = atoi(vec[2]);
+	}
+
+	if (parse_quota_name(name, &q, &idx) || val == Q_VAL_DISABLED)
+		return EINVAL;
+
+	quota[q].val[idx] = val;
+
+	send_ack(conn, XS_SET_QUOTA);
+
+	return 0;
+}
+
+static int close_xgt_handle(void *_handle)
+{
+	xengnttab_close(*(xengnttab_handle **)_handle);
+	return 0;
+}
+
+static char store_domain_path[] = "/local/domain/65535";
+
+/* Returns the implicit path of a connection (only domains have this) */
+const char *get_implicit_path(const struct connection *conn)
+{
+	if (!conn->domain)
+		return store_domain_path;
+	return conn->domain->path;
+}
+
+static bool init_domain(unsigned int domid)
+{
+	evtchn_port_t port;
+	struct domain *domain;
+
+	port = get_domain_evtchn(domid);
+	if (port == -1)
+		barf_perror("Failed to initialize dom%u port", domid);
+
+	domain = introduce_domain(NULL, domid, port, false);
+	if (!domain) {
+		xprintf("Could not initialize dom%u\n", domid);
+		return false;
+	}
+
+	if (domain->interface)
+		domain->interface->connection = XENSTORE_CONNECTED;
+
+	xenevtchn_notify(xce_handle, domain->port);
+
+	return true;
+}
+void init_domains(bool live_update)
+{
+	unsigned int *domids = NULL;
+	unsigned int nr_domids = 0;
+	unsigned int domid;
+	unsigned int state;
+	unsigned int caps;
+	uint64_t unique_id;
+	int introduce_count = 0;
+
+	while (!xenmanage_poll_changed_domain(xm_handle, &domid, &state, &caps,
+					      &unique_id)) {
+		if (!live_update) {
+			nr_domids++;
+			domids = talloc_realloc(NULL, domids,
+						unsigned int, nr_domids);
+			if (!domids)
+				barf_perror("Failed to reallocate domids");
+
+			domids[nr_domids - 1] = domid;
+		}
+
+		if (caps & XENMANAGE_GETDOMSTATE_CAP_CONTROL) {
+			/*
+			 * Only update with first found - otherwise use command
+			 * line.
+			 */
+			if (priv_domid == DOMID_INVALID)
+				priv_domid = domid;
+		}
+
+		if (caps & XENMANAGE_GETDOMSTATE_CAP_XENSTORE) {
+			/*
+			 * Update with last found.  dom0 or dom0less will only
+			 * have 1 domain.  stubdom there will be dom0 and dom1,
+			 * so this will take the second for stubdom.
+			 */
+			store_domid = domid;
+		}
+	}
+
+	if (store_domid == DOMID_INVALID)
+		store_domid = priv_domid;
+
+	if (store_domid == DOMID_INVALID)
+		barf("Could not determine xenstore domid\n");
+
+	if (priv_domid == DOMID_INVALID)
+	{
+		priv_domid = store_domid;
+		xprintf("priv_domid defaulted to %u\n", priv_domid);
+	}
+
+	snprintf(store_domain_path, sizeof(store_domain_path),
+		 "/local/domain/%u", store_domid);
+
+	if (live_update)
+		return;
+
+	/*
+	 * Privileged domid must be first to setup structures for firing the
+	 * special watches.
+	 */
+	if (init_domain(priv_domid))
+		introduce_count++;
+
+	for (unsigned int i = 0; i < nr_domids; i++) {
+		domid = domids[i];
+		if (domid == priv_domid)
+			continue;
+
+		if (init_domain(domid))
+			introduce_count++;
+	}
+
+	talloc_free(domids);
+
+	if (introduce_count == 0)
+		barf("Did not initialize any domains");
+}
+
+void stubdom_init(bool live_update)
+{
+#ifdef __MINIOS__
+	mount_9pfs(live_update);
+#endif
+}
+
+static unsigned int domhash_fn(const void *k)
+{
+	return *(const unsigned int *)k;
+}
+
+static int domeq_fn(const void *key1, const void *key2)
+{
+	return *(const unsigned int *)key1 == *(const unsigned int *)key2;
+}
+
+void domain_early_init(void)
+{
+	/* Start with a random rather low domain count for the hashtable. */
+	domhash = create_hashtable(NULL, "domains", domhash_fn, domeq_fn, 0);
+	if (!domhash)
+		barf_perror("Failed to allocate domain hashtable");
+
+	xm_handle = xenmanage_open(NULL, 0);
+	if (!xm_handle)
+		barf_perror("Failed to open connection to libxenmanage");
+
+	xgt_handle = talloc(talloc_autofree_context(), xengnttab_handle*);
+	if (!xgt_handle)
+		barf_perror("Failed to allocate domain gnttab handle");
+
+	*xgt_handle = xengnttab_open(NULL, 0);
+	if (*xgt_handle == NULL)
+		barf_perror("Failed to open connection to gnttab");
+
+	/*
+	 * Allow max number of domains for mappings. We allow one grant per
+	 * domain so the theoretical maximum is DOMID_FIRST_RESERVED.
+	 */
+	xengnttab_set_max_grants(*xgt_handle, DOMID_FIRST_RESERVED);
+
+	talloc_set_destructor(xgt_handle, close_xgt_handle);
+}
+
+void domain_init(int evtfd)
+{
+	int rc;
+
+	if (evtfd < 0)
+		xce_handle = xenevtchn_open(NULL, XENEVTCHN_NO_CLOEXEC);
+	else
+		xce_handle = evtchn_fdopen(evtfd);
+
+	if (xce_handle == NULL)
+		barf_perror("Failed to open evtchn device");
+
+	if ((rc = xenevtchn_bind_virq(xce_handle, VIRQ_DOM_EXC)) == -1)
+		barf_perror("Failed to bind to domain exception virq port");
+	virq_port = rc;
+}
+
+void domain_deinit(void)
+{
+	if (virq_port)
+		xenevtchn_unbind(xce_handle, virq_port);
+
+	xenmanage_close(xm_handle);
+}
+
+/*
+ * Check whether a domain was created before or after a specific generation
+ * count (used for testing whether a node permission is older than a domain).
+ *
+ * Return values:
+ *  false: domain has higher generation count (it is younger than a node with
+ *     the given count), or domain isn't existing any longer
+ *  true: domain is older than the node
+ */
+static bool chk_domain_generation(unsigned int domid, uint64_t gen)
+{
+	struct domain *d;
+
+	d = find_domain_struct(domid);
+
+	return d && d->generation <= gen;
+}
+
+/*
+ * Allocate all missing struct domain referenced by a permission set.
+ * Any permission entries for not existing domains will be marked to be
+ * ignored.
+ * A DOMID_ANY entry will be marked to be ignored, if the writing
+ * domain doesn't have the XENSTORE_SERVER_FEATURE_DOMID_ANY enabled. Note
+ * that Xen tools will never set DOMID_ANY for a guest owned node.
+ */
+int domain_alloc_permrefs(const struct connection *conn,
+			  struct node_perms *perms)
+{
+	unsigned int i, domid;
+	struct domain *d;
+	uint64_t unique_id;
+
+	for (i = 0; i < perms->num; i++) {
+		domid = perms->p[i].id;
+		if (domid == DOMID_ANY) {
+			if (!(conn->domain->features &
+			      XENSTORE_SERVER_FEATURE_DOMID_ANY))
+				perms->p[i].perms |= XS_PERM_IGNORE;
+			continue;
+		}
+		d = find_domain_struct(domid);
+		if (!d) {
+			if (xenmanage_get_domain_info(xm_handle, domid, NULL,
+						      NULL, &unique_id))
+				perms->p[i].perms |= XS_PERM_IGNORE;
+			else if (!alloc_domain(NULL, domid, unique_id))
+				return ENOMEM;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Remove permissions for no longer existing domains in order to avoid a new
+ * domain with the same domid inheriting the permissions.
+ */
+int domain_adjust_node_perms(struct node *node)
+{
+	unsigned int i;
+	struct xs_permissions *perms = node->perms;
+	bool copied = false;
+
+	for (i = 1; i < node->hdr.num_perms; i++) {
+		if ((perms[i].perms & XS_PERM_IGNORE) ||
+		    perms[i].id == DOMID_ANY ||
+		    chk_domain_generation(perms[i].id, node->hdr.generation))
+			continue;
+
+		/*
+		 * Don't do a in-place modification, as the node might
+		 * reference data directly in the data base, which we don't
+		 * want to modify.
+		 */
+		if (!copied) {
+			perms = talloc_memdup(node, node->perms,
+					node->hdr.num_perms * sizeof(*perms));
+			if (!perms)
+				return ENOMEM;
+			node->perms = perms;
+			copied = true;
+		}
+
+		perms[i].perms |= XS_PERM_IGNORE;
+	}
+
+	return 0;
+}
+
+static void domain_acc_valid_max(struct domain *d, enum accitem what,
+				 unsigned int val)
+{
+	assert(what < ARRAY_SIZE(d->acc));
+	assert(what < ARRAY_SIZE(quotas));
+
+	if (val > d->acc[what].max)
+		d->acc[what].max = val;
+	if (val > quotas[what].max && domid_is_unprivileged(d->domid))
+		quotas[what].max = val;
+}
+
+static int domain_acc_add_valid(struct domain *d, enum accitem what, int add)
+{
+	unsigned int val;
+
+	assert(what < ARRAY_SIZE(d->acc_val));
+
+	if ((add < 0 && -add > d->acc_val[what]) ||
+	    (add > 0 && (INT_MAX - d->acc_val[what]) < add)) {
+		/*
+		 * In a transaction when a node is being added/removed AND the
+		 * same node has been added/removed outside the transaction in
+		 * parallel, the resulting value will be wrong. This is no
+		 * problem, as the transaction will fail due to the resulting
+		 * conflict.
+		 */
+		return (add < 0) ? 0 : INT_MAX;
+	}
+
+	val = d->acc_val[what] + add;
+	domain_acc_valid_max(d, what, val);
+
+	return val;
+}
+
+static int domain_acc_add(struct connection *conn, unsigned int domid,
+			  enum accitem what, int add, bool no_dom_alloc)
+{
+	struct domain *d;
+	struct changed_domain *cd;
+	struct list_head *head;
+	int ret;
+
+	if (conn && domid == conn->id && conn->domain)
+		d = conn->domain;
+	else if (no_dom_alloc) {
+		d = find_domain_struct(domid);
+		if (!d) {
+			errno = ENOENT;
+			corrupt(conn, "Missing domain %u\n", domid);
+			return -1;
+		}
+	} else {
+		d = find_or_alloc_existing_domain(domid);
+		if (!d) {
+			errno = ENOMEM;
+			return -1;
+		}
+	}
+
+	/* Temporary accounting data until final commit? */
+	if (conn && conn->in && what < ACC_REQ_N) {
+		/* Consider transaction local data. */
+		ret = 0;
+		if (conn->transaction && what < ACC_TR_N) {
+			head = transaction_get_changed_domains(
+				conn->transaction);
+			cd = acc_find_changed_domain(head, domid);
+			if (cd)
+				ret = cd->acc[what];
+		}
+		ret += acc_add_changed_dom(conn->in, &conn->acc_list, what,
+					   add, domid);
+		return errno ? -1 : domain_acc_add_valid(d, what, ret);
+	}
+
+	if (conn && conn->transaction && what < ACC_TR_N) {
+		head = transaction_get_changed_domains(conn->transaction);
+		ret = acc_add_changed_dom(conn->transaction, head, what,
+					  add, domid);
+		if (errno) {
+			fail_transaction(conn->transaction);
+			return -1;
+		}
+		return domain_acc_add_valid(d, what, ret);
+	}
+
+	trace_acc("global change domid %u: what=%u %u add %d\n", domid, what,
+		  d->acc_val[what], add);
+	d->acc_val[what] = domain_acc_add_valid(d, what, add);
+
+	return d->acc_val[what];
+}
+
+void acc_drop(struct connection *conn)
+{
+	struct changed_domain *cd;
+
+	while ((cd = list_top(&conn->acc_list, struct changed_domain, list))) {
+		list_del(&cd->list);
+		talloc_free(cd);
+	}
+}
+
+void acc_commit(struct connection *conn)
+{
+	struct changed_domain *cd;
+	enum accitem what;
+	struct buffered_data *in = conn->in;
+
+	/*
+	 * Make sure domain_acc_add() below can't add additional data to
+	 * to be committed accounting records.
+	 */
+	conn->in = NULL;
+
+	while ((cd = list_top(&conn->acc_list, struct changed_domain, list))) {
+		list_del(&cd->list);
+		for (what = 0; what < ACC_REQ_N; what++)
+			if (cd->acc[what])
+				domain_acc_add(conn, cd->domid, what,
+					       cd->acc[what], true);
+
+		talloc_free(cd);
+	}
+
+	conn->in = in;
+}
+
+static int domain_reset_global_acc_sub(const void *k, void *v, void *arg)
+{
+	struct domain *d = v;
+	unsigned int i;
+
+	for (i = 0; i < ACC_N; i++)
+		d->acc[i].max = d->acc_val[i];
+
+	return 0;
+}
+
+void domain_reset_global_acc(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ACC_N; i++)
+		quotas[i].max = 0;
+
+	/* Set current max values seen. */
+	hashtable_iterate(domhash, domain_reset_global_acc_sub, NULL);
+}
+
+bool domain_max_chk(const struct connection *conn, enum accitem what,
+		    unsigned int val)
+{
+	if (!conn || !conn->domain)
+		return false;
+
+	if (domain_quota_val_exceeds(conn->domain, what, val))
+		return true;
+
+	domain_acc_valid_max(conn->domain, what, val);
+
+	return false;
+}
+
+int domain_nbentry_inc(struct connection *conn, unsigned int domid)
+{
+	return (domain_acc_add(conn, domid, ACC_NODES, 1, false) < 0)
+	       ? errno : 0;
+}
+
+int domain_nbentry_dec(struct connection *conn, unsigned int domid)
+{
+	return (domain_acc_add(conn, domid, ACC_NODES, -1, true) < 0)
+	       ? errno : 0;
+}
+
+int domain_nbentry_fix(unsigned int domid, int num)
+{
+	return domain_acc_add(NULL, domid, ACC_NODES, num, true);
+}
+
+static bool domain_chk_quota(struct connection *conn, unsigned int mem)
+{
+	time_t now;
+	struct domain *domain;
+
+	if (!conn || !conn->domain || !domid_is_unprivileged(conn->id) ||
+	    conn->is_ignored)
+		return false;
+
+	domain = conn->domain;
+	now = time(NULL);
+
+	if (domain_quota_val_exceeds(domain, ACC_MEM, mem)) {
+		if (domain->hard_quota_reported)
+			return true;
+		syslog(LOG_ERR, "Domain %u exceeds hard memory quota, Xenstore interface to domain stalled\n",
+		       domain->domid);
+		domain->mem_last_msg = now;
+		domain->hard_quota_reported = true;
+		return true;
+	}
+
+	if (now - domain->mem_last_msg >= MEM_WARN_MINTIME_SEC) {
+		unsigned int soft_mem = domain_get_soft_quota(domain, ACC_MEM);
+
+		if (domain->hard_quota_reported) {
+			domain->mem_last_msg = now;
+			domain->hard_quota_reported = false;
+			syslog(LOG_INFO, "Domain %u below hard memory quota again\n",
+			       domain->domid);
+		}
+		if (mem >= soft_mem && soft_mem &&
+		    !domain->soft_quota_reported) {
+			domain->mem_last_msg = now;
+			domain->soft_quota_reported = true;
+			syslog(LOG_WARNING, "Domain %u exceeds soft memory quota\n",
+			       domain->domid);
+		}
+		if (mem < soft_mem && domain->soft_quota_reported) {
+			domain->mem_last_msg = now;
+			domain->soft_quota_reported = false;
+			syslog(LOG_INFO, "Domain %u below soft memory quota again\n",
+			       domain->domid);
+		}
+
+	}
+
+	return false;
+}
+
+int domain_memory_add(struct connection *conn, unsigned int domid, int mem,
+		      bool no_quota_check)
+{
+	int ret;
+
+	ret = domain_acc_add(conn, domid, ACC_MEM, 0, true);
+	if (ret < 0)
+		return -ret;
+
+	/*
+	 * domain_chk_quota() will print warning and also store whether the
+	 * soft/hard quota has been hit. So check no_quota_check *after*.
+	 */
+	if (domain_chk_quota(conn, ret + mem) && !no_quota_check)
+		return ENOMEM;
+
+	/*
+	 * The domain the memory is to be accounted for should always exist,
+	 * as accounting is done either for a domain related to the current
+	 * connection, or for the domain owning a node (which is always
+	 * existing, as the owner of the node is tested to exist and deleted
+	 * or replaced by domid 0 if not).
+	 * So not finding the related domain MUST be an error in the data base.
+	 */
+	domain_acc_add(conn, domid, ACC_MEM, mem, true);
+
+	return 0;
+}
+
+void domain_watch_inc(struct connection *conn)
+{
+	domain_acc_add(conn, conn->id, ACC_WATCH, 1, true);
+}
+
+void domain_watch_dec(struct connection *conn)
+{
+	domain_acc_add(conn, conn->id, ACC_WATCH, -1, true);
+}
+
+void domain_outstanding_inc(struct connection *conn)
+{
+	domain_acc_add(conn, conn->id, ACC_OUTST, 1, true);
+}
+
+void domain_outstanding_dec(struct connection *conn, unsigned int domid)
+{
+	domain_acc_add(conn, domid, ACC_OUTST, -1, true);
+}
+
+void domain_transaction_inc(struct connection *conn)
+{
+	domain_acc_add(conn, conn->id, ACC_TRANS, 1, true);
+}
+
+void domain_transaction_dec(struct connection *conn)
+{
+	domain_acc_add(conn, conn->id, ACC_TRANS, -1, true);
+}
+
+const char *dump_state_connections(FILE *fp)
+{
+	const char *ret = NULL;
+	unsigned int conn_id = 1;
+	struct xs_state_connection sc;
+	struct xs_state_record_header head;
+	struct connection *c;
+
+	BUILD_BUG_ON(sizeof(c->domain->unique_id) != sizeof(uint64_t));
+
+	list_for_each_entry(c, &connections, list) {
+		head.type = XS_STATE_TYPE_CONN;
+		head.length = sizeof(sc);
+
+		sc.conn_id = conn_id++;
+		sc.fields = 0;
+		memset(&sc.spec, 0, sizeof(sc.spec));
+		if (c->domain) {
+			sc.conn_type = XS_STATE_CONN_TYPE_RING;
+			sc.spec.ring.domid = c->id;
+			sc.spec.ring.tdomid = c->target ? c->target->id
+						: DOMID_INVALID;
+			sc.spec.ring.evtchn = c->domain->port;
+		} else {
+			sc.conn_type = XS_STATE_CONN_TYPE_SOCKET;
+			sc.spec.socket_fd = c->fd;
+		}
+
+		ret = dump_state_buffered_data(NULL, c, &sc);
+		if (ret)
+			return ret;
+		head.length += sc.data_in_len + sc.data_out_len;
+		head.length = ROUNDUP(head.length, 8);
+		if (c->domain) {
+			sc.fields |= XS_STATE_CONN_FIELDS_UNIQ_ID;
+			head.length += sizeof(uint64_t);
+		}
+		if (fwrite(&head, sizeof(head), 1, fp) != 1)
+			return "Dump connection state error";
+		if (fwrite(&sc, offsetof(struct xs_state_connection, data),
+			   1, fp) != 1)
+			return "Dump connection state error";
+		ret = dump_state_buffered_data(fp, c, NULL);
+		if (ret)
+			return ret;
+		ret = dump_state_align(fp);
+		if (ret)
+			return ret;
+		if (c->domain &&
+		    fwrite(&c->domain->unique_id, sizeof(uint64_t), 1, fp) != 1)
+			return "Dump connection state error";
+
+		ret = dump_state_watches(fp, c, sc.conn_id);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
+void read_state_connection(const void *ctx, const void *state)
+{
+	const struct xs_state_connection *sc = state;
+	struct connection *conn;
+	struct domain *domain, *tdomain;
+
+	if (sc->conn_type == XS_STATE_CONN_TYPE_SOCKET) {
+		conn = add_socket_connection(sc->spec.socket_fd);
+		domain = NULL;
+	} else {
+		domain = introduce_domain(ctx, sc->spec.ring.domid,
+					  sc->spec.ring.evtchn, true);
+		if (!domain)
+			barf("domain allocation error");
+
+		conn = domain->conn;
+
+		/*
+		 * We may not have been able to restore the domain (for
+		 * instance because it revoked the Xenstore grant). We need
+		 * to keep it around to send @releaseDomain when it is
+		 * dead. So mark it as ignored.
+		 */
+		if (!domain->port || !domain->interface)
+			ignore_connection(conn, XENSTORE_ERROR_COMM);
+
+		if (sc->spec.ring.tdomid != DOMID_INVALID) {
+			tdomain = find_or_alloc_domain(ctx,
+						       sc->spec.ring.tdomid);
+			if (!tdomain)
+				barf("target domain allocation error");
+			talloc_reference(domain->conn, tdomain->conn);
+			domain->conn->target = tdomain->conn;
+		}
+	}
+
+	conn->conn_id = sc->conn_id;
+
+	read_state_buffered_data(ctx, conn, sc);
+
+	/* Validity of unique_id will be tested by check_domains() later. */
+	if ((sc->fields & XS_STATE_CONN_FIELDS_UNIQ_ID) && domain) {
+		unsigned long off;
+
+		off = sizeof(*sc) + sc->data_in_len + sc->data_out_len;
+		domain->unique_id =
+		    *(uint64_t *)(state + ROUNDUP(off, 8));
+	}
+}
+
+/* Returns number of quota and adds length of quota names to *len. */
+static unsigned int get_quota_size(struct quota *quota, unsigned int *len)
+{
+	unsigned int q;
+	unsigned int n = 0;
+
+	*len = 0;
+	for (q = 0; q < ACC_N; q++) {
+		if (!quota_adm[q].name)
+			continue;
+		if (quota[q].val[Q_IDX_HARD] != Q_VAL_DISABLED) {
+			n++;
+			*len += strlen(quota_adm[q].name) + 1;
+		}
+		if (quota[q].val[Q_IDX_SOFT] != Q_VAL_DISABLED) {
+			n++;
+			*len += strlen(quota_adm[q].name) + SOFT_PREFIX_LEN + 1;
+		}
+	}
+
+	return n;
+}
+
+static void build_quota_data(struct quota *quota, uint32_t *val,
+			     char *names_buf)
+{
+	unsigned int q;
+	unsigned int n = 0;
+
+	for (q = 0; q < ACC_N; q++) {
+		if (!quota_adm[q].name)
+			continue;
+		if (quota[q].val[Q_IDX_HARD] != Q_VAL_DISABLED) {
+			val[n++] = quota[q].val[Q_IDX_HARD];
+			strcpy(names_buf, quota_adm[q].name);
+			names_buf += strlen(names_buf) + 1;
+		}
+		if (quota[q].val[Q_IDX_SOFT] != Q_VAL_DISABLED) {
+			val[n++] = quota[q].val[Q_IDX_SOFT];
+			strcpy(names_buf, SOFT_PREFIX);
+			strcpy(names_buf + SOFT_PREFIX_LEN, quota_adm[q].name);
+			names_buf += strlen(names_buf) + 1;
+		}
+	}
+}
+
+static void parse_quota_data(const uint32_t *val, const char *name,
+			     unsigned int n, struct quota *quota)
+{
+	unsigned int i, q, idx;
+
+	for (i = 0; i < n; i++) {
+		if (!parse_quota_name(name, &q, &idx))
+			quota[q].val[idx] = val[i];
+		name += strlen(name) + 1;
+	}
+}
+
+static int dump_state_domain(const void *k, void *v, void *arg)
+{
+	struct domain *domain = v;
+	FILE *fp = arg;
+	struct xs_state_domain *sd;
+	struct xs_state_record_header *head;
+	void *record;
+	unsigned int n_quota;
+	unsigned int rec_len;
+	size_t ret;
+
+	n_quota = get_quota_size(domain->acc, &rec_len);
+	rec_len += n_quota * sizeof(sd->quota_val[0]);
+	rec_len += sizeof(*sd);
+	rec_len = ROUNDUP(rec_len, 8);
+
+	record = talloc_size(NULL, rec_len + sizeof(*head));
+	if (!record)
+		return 1;
+
+	head = record;
+	head->type = XS_STATE_TYPE_DOMAIN;
+	head->length = rec_len;
+
+	sd = (struct xs_state_domain *)(head + 1);
+	sd->domain_id = domain->domid;
+	sd->n_quota = n_quota;
+	sd->features = (lu_status->version > 1) ? domain->features : 0;
+
+	build_quota_data(domain->acc, sd->quota_val,
+			 (char *)(sd->quota_val + n_quota));
+
+	ret = fwrite(record, rec_len + sizeof(*head), 1, fp);
+
+	talloc_free(record);
+
+	return (ret != 1 || dump_state_align(fp)) ? 1 : 0;
+}
+
+const char *dump_state_domains(FILE *fp)
+{
+	const char *ret = NULL;
+
+	if (hashtable_iterate(domhash, dump_state_domain, fp))
+		ret = "Dump domain error";
+
+	return ret;
+}
+
+void read_state_domain(const void *ctx, const void *state, unsigned int version)
+{
+	const struct xs_state_domain *sd = state;
+	struct domain *domain;
+	unsigned int n_quota = sd->n_quota;
+	const char *name = (const char *)(sd->quota_val + n_quota);
+
+	domain = find_domain_struct(sd->domain_id);
+	if (!domain)
+		barf("referenced domain not found");
+
+	if (version > 1)
+		domain->features = sd->features;
+
+	parse_quota_data(sd->quota_val, name, n_quota, domain->acc);
+}
+
+const char *dump_state_glb_quota(FILE *fp)
+{
+	struct xs_state_record_header *head;
+	struct xs_state_glb_quota *glb;
+	void *record;
+	unsigned int n_quota;
+	unsigned int rec_len;
+	size_t ret;
+
+	n_quota = get_quota_size(quotas, &rec_len);
+	rec_len += n_quota * sizeof(glb->quota_val[0]);
+	rec_len += sizeof(*glb);
+	rec_len = ROUNDUP(rec_len, 8);
+
+	record = talloc_size(NULL, rec_len + sizeof(*head));
+	if (!record)
+		return "Dump global quota allocation error";
+
+	head = record;
+	head->type = XS_STATE_TYPE_GLB_QUOTA;
+	head->length = rec_len;
+
+	glb = (struct xs_state_glb_quota *)(head + 1);
+	glb->n_dom_quota = n_quota;
+	glb->n_glob_quota = 0;
+
+	build_quota_data(quotas, glb->quota_val,
+			 (char *)(glb->quota_val + n_quota));
+
+	ret = fwrite(record, rec_len + sizeof(*head), 1, fp);
+
+	talloc_free(record);
+
+	if (ret != 1 || dump_state_align(fp))
+		return "Dump global quota error";
+
+	return NULL;
+}
+
+void read_state_glb_quota(const void *ctx, const void *state)
+{
+	const struct xs_state_glb_quota *glb = state;
+	unsigned int n_quota = glb->n_dom_quota + glb->n_glob_quota;
+	const char *name = (const char *)(glb->quota_val + n_quota);
+
+	parse_quota_data(glb->quota_val, name, n_quota, quotas);
+}
+
+struct domain_acc {
+	unsigned int domid;
+	int nodes;
+};
+
+static int domain_check_acc_init_sub(const void *k, void *v, void *arg)
+{
+	struct hashtable *domains = arg;
+	struct domain *d = v;
+	struct domain_acc *dom;
+
+	dom = talloc_zero(NULL, struct domain_acc);
+	if (!dom)
+		return -1;
+
+	dom->domid = d->domid;
+	/*
+	 * Set the initial value to the negative one of the current domain.
+	 * If everything is correct incrementing the value for each node will
+	 * result in dom->nodes being 0 at the end.
+	 */
+	dom->nodes = -d->acc_val[ACC_NODES];
+
+	if (hashtable_add(domains, &dom->domid, dom)) {
+		talloc_free(dom);
+		return -1;
+	}
+
+	return 0;
+}
+
+struct hashtable *domain_check_acc_init(void)
+{
+	struct hashtable *domains;
+
+	domains = create_hashtable(NULL, "domain_check", domhash_fn, domeq_fn,
+				   HASHTABLE_FREE_VALUE);
+	if (!domains)
+		return NULL;
+
+	if (hashtable_iterate(domhash, domain_check_acc_init_sub, domains)) {
+		hashtable_destroy(domains);
+		return NULL;
+	}
+
+	return domains;
+}
+
+void domain_check_acc_add(const struct node *node, struct hashtable *domains)
+{
+	struct domain_acc *dom;
+	unsigned int domid;
+
+	domid = get_node_owner(node);
+	dom = hashtable_search(domains, &domid);
+	if (!dom)
+		log("Node %s owned by unknown domain %u", node->name, domid);
+	else
+		dom->nodes++;
+}
+
+static int domain_check_acc_cb(const void *k, void *v, void *arg)
+{
+	struct domain_acc *dom = v;
+	struct domain *d;
+
+	if (!dom->nodes)
+		return 0;
+
+	log("Correct accounting data for domain %u: nodes are %d off",
+	    dom->domid, dom->nodes);
+
+	d = find_domain_struct(dom->domid);
+	if (!d)
+		return 0;
+
+	d->acc_val[ACC_NODES] += dom->nodes;
+
+	return 0;
+}
+
+void domain_check_acc(struct hashtable *domains)
+{
+	hashtable_iterate(domains, domain_check_acc_cb, NULL);
+}
+
+/*
+ * Local variables:
+ *  mode: C
+ *  c-file-style: "linux"
+ *  indent-tabs-mode: t
+ *  c-basic-offset: 8
+ *  tab-width: 8
+ * End:
+ */

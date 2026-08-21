@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+	<modelVersion>4.0.0</modelVersion>
+
+	<parent>
+		<groupId>org.eclipse.store</groupId>
+		<artifactId>afs-parent</artifactId>
+		<version>5.0.0-SNAPSHOT</version>
+		<relativePath>../pom.xml</relativePath>
+	</parent>
+
+	<artifactId>afs-aws-parent</artifactId>
+	<packaging>pom</packaging>
+	
+	<name>EclipseStore Abstract File System AWS Parent</name>
+	<description>EclipseStore File System Abstraction for AWS</description>
+	<url>https://projects.eclipse.org/projects/technology.store</url>
+
+    <properties>
+        <aws.sdk.version>2.46.11</aws.sdk.version>
+    </properties>
+
+	<modules>
+		<module>aws</module>
+		<module>dynamodb</module>
+		<module>s3</module>
+	</modules>
+
+</project>

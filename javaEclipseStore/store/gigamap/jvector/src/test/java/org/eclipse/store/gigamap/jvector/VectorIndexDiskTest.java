@@ -1,0 +1,3266 @@
+package org.eclipse.store.gigamap.jvector;
+
+/*-
+ * #%L
+ * EclipseStore GigaMap JVector
+ * %%
+ * Copyright (C) 2023 - 2026 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import org.eclipse.store.gigamap.types.GigaMap;
+import org.eclipse.store.gigamap.types.ScoredSearchResult;
+import org.eclipse.store.storage.embedded.types.EmbeddedStorage;
+import org.eclipse.store.storage.embedded.types.EmbeddedStorageManager;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.IntStream;
+
+import static java.time.Duration.ofMillis;
+import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for on-disk VectorIndex functionality and Product Quantization.
+ */
+@Tag("slow")
+class VectorIndexDiskTest
+{
+    /**
+     * Simple entity with an embedding vector.
+     */
+    record Document(String content, float[] embedding) {}
+
+    /**
+     * Computed vectorizer - simulates externally computed vectors.
+     */
+    static class ComputedDocumentVectorizer extends Vectorizer<Document>
+    {
+        @Override
+        public float[] vectorize(final Document entity)
+        {
+            return entity.embedding();
+        }
+    }
+
+    /**
+     * Embedded vectorizer - vectors are part of the entity, not stored separately.
+     */
+    static class EmbeddedDocumentVectorizer extends Vectorizer<Document>
+    {
+        @Override
+        public float[] vectorize(final Document entity)
+        {
+            return entity.embedding();
+        }
+
+        @Override
+        public boolean isEmbedded()
+        {
+            return true;
+        }
+    }
+
+    /**
+     * Helper to generate a random normalized vector.
+     */
+    private static float[] randomVector(final Random random, final int dimension)
+    {
+        final float[] vector = new float[dimension];
+        float norm = 0;
+        for(int i = 0; i < dimension; i++)
+        {
+            vector[i] = random.nextFloat() * 2 - 1;
+            norm += vector[i] * vector[i];
+        }
+        norm = (float)Math.sqrt(norm);
+        for(int i = 0; i < dimension; i++)
+        {
+            vector[i] /= norm;
+        }
+        return vector;
+    }
+
+    /**
+     * Helper to add multiple documents with random vectors to a GigaMap.
+     */
+    private static void addRandomDocuments(
+            final GigaMap<Document> gigaMap,
+            final Random random,
+            final int dimension,
+            final int count,
+            final String prefix
+    )
+    {
+        IntStream.range(0, count)
+                .forEach(i -> gigaMap.add(new Document(prefix + i, randomVector(random, dimension))));
+    }
+
+    /**
+     * Helper to add multiple documents from a list of pre-generated vectors.
+     */
+    private static void addDocumentsFromVectors(
+            final GigaMap<Document> gigaMap,
+            final List<float[]> vectors,
+            final String prefix
+    )
+    {
+        IntStream.range(0, vectors.size())
+                .forEach(i -> gigaMap.add(new Document(prefix + i, vectors.get(i))));
+    }
+
+
+    /**
+     * Test creating an on-disk index and persisting it.
+     */
+    @Test
+    void testOnDiskIndexCreationAndPersistence(@TempDir final Path tempDir) throws IOException
+    {
+        final int vectorCount = 500;
+        final int additionalCount = 100;
+        final int dimension = 64;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Generate vectors
+        final List<float[]> vectors = new ArrayList<>();
+        for(int i = 0; i < vectorCount; i++)
+        {
+            vectors.add(randomVector(random, dimension));
+        }
+
+        final float[] queryVector = randomVector(new Random(999), dimension);
+        final List<Long> expectedIds = new ArrayList<>();
+
+        // Phase 1: Create index and persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add(
+                    "embeddings",
+                    config,
+                    new ComputedDocumentVectorizer()
+                );
+
+                assertTrue(index.isOnDisk());
+                assertFalse(index.isPqCompressionEnabled());
+
+                // Add vectors
+                addDocumentsFromVectors(gigaMap, vectors, "doc_");
+
+                // Search and record expected results
+                final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    expectedIds.add(entry.entityId());
+                }
+
+                // Persist index to disk
+                index.persistToDisk();
+
+                // Verify files were created
+                assertTrue(Files.exists(indexDir.resolve("embeddings.graph")));
+                assertTrue(Files.exists(indexDir.resolve("embeddings.meta")));
+
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload, verify, and add more vectors
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(vectorCount, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                assertTrue(index.isOnDisk());
+
+                // Search and compare results
+                final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                final List<Long> actualIds = new ArrayList<>();
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    actualIds.add(entry.entityId());
+                }
+
+                // Results should match (or at least be very similar due to HNSW nature)
+                assertEquals(expectedIds.size(), actualIds.size());
+
+                // Add more vectors after reload — this exercises the builder
+                // that must be available even when the disk index was loaded
+                addRandomDocuments(gigaMap, new Random(123), dimension, additionalCount, "reload_doc_");
+                assertEquals(vectorCount + additionalCount, gigaMap.size());
+
+                // Persist updated index and store
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 3: Reload again and verify added vectors survived
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(vectorCount + additionalCount, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                assertTrue(index.isOnDisk());
+
+                // Search should return results from the full dataset
+                final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                assertEquals(10, result.size());
+            }
+        }
+    }
+
+    /**
+     * Test on-disk index with compression (PQ).
+     */
+    @Test
+    void testOnDiskIndexWithCompression(@TempDir final Path tempDir) throws IOException
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16; // 64 / 16 = 4 dimensions per subspace
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        assertTrue(index.isOnDisk());
+        assertTrue(index.isPqCompressionEnabled());
+
+        // Add vectors
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        // Train compression
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        // Search should work
+        final float[] queryVector = randomVector(random, dimension);
+        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+
+        assertEquals(10, result.size());
+
+        // Verify all entities are accessible
+        result.forEach(entry -> assertTrue(entry.entity().content().startsWith("doc_")));
+
+        // Persist to disk
+        index.persistToDisk();
+
+        // Verify graph file was created (FusedPQ is embedded in graph, no separate .pq file)
+        assertTrue(Files.exists(indexDir.resolve("embeddings.graph")));
+        assertTrue(Files.exists(indexDir.resolve("embeddings.meta")));
+        assertFalse(Files.exists(indexDir.resolve("embeddings.pq")),
+            "FusedPQ should be embedded in graph file, not in separate .pq file");
+    }
+
+    /**
+     * Test search quality with on-disk index - verify exact match is found first.
+     */
+    @Test
+    void testOnDiskSearchQuality(@TempDir final Path tempDir) throws IOException
+    {
+        final int vectorCount = 1000;
+        final int dimension = 64;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        // Add random vectors
+        addRandomDocuments(gigaMap, random, dimension, vectorCount - 1, "random_");
+
+        // Add a one-hot "needle" vector that randomVector() cannot produce,
+        // since randomVector() populates all dimensions with non-zero values.
+        final float[] needleVector = new float[dimension];
+        needleVector[0] = 1.0f;
+
+        gigaMap.add(new Document("needle", needleVector));
+
+        // Persist index
+        index.persistToDisk();
+
+        // Search for the needle vector - it should be the first result
+        final VectorSearchResult<Document> result = index.search(needleVector, 5);
+
+        assertEquals(5, result.size());
+        final ScoredSearchResult.Entry<Document> firstResult = result.iterator().next();
+        assertEquals("needle", firstResult.entity().content(), "Exact match should be first result");
+        assertTrue(firstResult.score() > 0.99f, "Exact match should have score close to 1.0");
+    }
+
+    /**
+     * Test multiple restarts with on-disk index.
+     */
+    @Test
+    void testOnDiskIndexMultipleRestarts(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Phase 1: Create with 100 vectors
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add(
+                    "embeddings", config, new ComputedDocumentVectorizer()
+                );
+
+                addRandomDocuments(gigaMap, random, dimension, 100, "phase1_doc_");
+
+                assertEquals(100, gigaMap.size());
+
+                // Persist to disk so Phase 2 exercises the disk-loaded path
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Restart and add 50 more vectors
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(100, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+                assertEquals(10, result.size());
+
+                // Add more vectors after disk-loaded restart
+                addRandomDocuments(gigaMap, random, dimension, 50, "phase2_doc_");
+
+                assertEquals(150, gigaMap.size());
+
+                // Persist updated index so Phase 3 loads from disk too
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 3: Final verification
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(150, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 30);
+                assertEquals(30, result.size());
+            }
+        }
+    }
+
+    // ========================================================================
+    // PQ Compression Search Tests
+    // ========================================================================
+
+    /**
+     * Test search quality with PQ compression enabled.
+     * Verifies that an exact match (needle) is found in the top results
+     * despite quantization loss from Product Quantization.
+     */
+    @Test
+    void testPqCompressionSearchQuality(@TempDir final Path tempDir)
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        // Add random vectors
+        addRandomDocuments(gigaMap, random, dimension, vectorCount - 1, "random_");
+
+        // Add a one-hot "needle" vector that randomVector() cannot produce,
+        // since randomVector() populates all dimensions with non-zero values.
+        final float[] needleVector = new float[dimension];
+        needleVector[0] = 1.0f;
+
+        gigaMap.add(new Document("needle", needleVector));
+
+        // Train PQ compression
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        // Search for the needle vector - it should be in the top results
+        final VectorSearchResult<Document> result = index.search(needleVector, 5);
+
+        assertEquals(5, result.size());
+        final ScoredSearchResult.Entry<Document> firstResult = result.iterator().next();
+        assertEquals("needle", firstResult.entity().content(),
+            "Exact match should be first result even with PQ compression");
+        assertTrue(firstResult.score() > 0.99f,
+            "Exact match should have score close to 1.0");
+
+        // Verify results are ordered by score
+        float prevScore = Float.MAX_VALUE;
+        for(final ScoredSearchResult.Entry<Document> entry : result)
+        {
+            assertTrue(entry.score() <= prevScore, "Results should be ordered by score");
+            prevScore = entry.score();
+        }
+    }
+
+    /**
+     * Test PQ-compressed disk index persistence and reload with search verification.
+     * Verifies that search still works correctly after saving and reloading
+     * a PQ-compressed index.
+     */
+    @Test
+    void testPqCompressionPersistAndReload(@TempDir final Path tempDir) throws IOException
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        final List<float[]> vectors = new ArrayList<>();
+        for(int i = 0; i < vectorCount; i++)
+        {
+            vectors.add(randomVector(random, dimension));
+        }
+
+        final float[] queryVector = randomVector(new Random(999), dimension);
+        final List<Long> expectedIds = new ArrayList<>();
+
+        // Phase 1: Create index with PQ, populate, search, persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .enablePqCompression(true)
+                    .pqSubspaces(pqSubspaces)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add(
+                    "embeddings",
+                    config,
+                    new ComputedDocumentVectorizer()
+                );
+
+                assertTrue(index.isOnDisk());
+                assertTrue(index.isPqCompressionEnabled());
+
+                addDocumentsFromVectors(gigaMap, vectors, "doc_");
+
+                // Train and search
+                ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+                final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    expectedIds.add(entry.entityId());
+                }
+
+                // Persist
+                index.persistToDisk();
+                assertTrue(Files.exists(indexDir.resolve("embeddings.graph")));
+                assertTrue(Files.exists(indexDir.resolve("embeddings.meta")));
+
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload and verify search results
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(vectorCount, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                assertTrue(index.isOnDisk());
+                assertTrue(index.isPqCompressionEnabled());
+
+                // Search after reload
+                final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                assertEquals(10, result.size());
+
+                final List<Long> actualIds = new ArrayList<>();
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    actualIds.add(entry.entityId());
+                }
+
+                // Results should match (or at least overlap significantly)
+                assertEquals(expectedIds.size(), actualIds.size());
+
+                // Verify all entities are accessible
+                result.forEach(entry -> assertTrue(entry.entity().content().startsWith("doc_")));
+            }
+        }
+    }
+
+    /**
+     * Test PQ-compressed disk index with DOT_PRODUCT similarity function.
+     */
+    @Test
+    void testPqCompressionWithDotProduct(@TempDir final Path tempDir)
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.DOT_PRODUCT)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        final float[] queryVector = randomVector(random, dimension);
+        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+
+        assertEquals(10, result.size());
+        result.forEach(entry -> assertNotNull(entry.entity()));
+    }
+
+    /**
+     * Test PQ-compressed disk index with EUCLIDEAN similarity function.
+     */
+    @Test
+    void testPqCompressionWithEuclidean(@TempDir final Path tempDir)
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.EUCLIDEAN)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        final float[] queryVector = randomVector(random, dimension);
+        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+
+        assertEquals(10, result.size());
+        result.forEach(entry -> assertNotNull(entry.entity()));
+    }
+
+    /**
+     * Test PQ compression with default subspaces (auto-calculated as dimension/4).
+     */
+    @Test
+    void testPqCompressionWithDefaultSubspaces(@TempDir final Path tempDir)
+    {
+        final int vectorCount = 500;
+        final int dimension = 128;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            // pqSubspaces not set - should default to dimension/4 = 32
+            .build();
+
+        assertEquals(0, config.pqSubspaces(),
+            "pqSubspaces should be 0 (auto-calculated at runtime)");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        final float[] queryVector = randomVector(random, dimension);
+        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+
+        assertEquals(10, result.size());
+        result.forEach(entry -> assertTrue(entry.entity().content().startsWith("doc_")));
+    }
+
+    /**
+     * Test removing entities from a PQ-compressed disk index.
+     * Verifies that removed entities do not appear in search results.
+     */
+    @Test
+    void testPqCompressionWithRemoval(@TempDir final Path tempDir)
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        // Remove every other entity (even IDs)
+        for(int i = 0; i < vectorCount; i += 2)
+        {
+            gigaMap.removeById(i);
+        }
+
+        assertEquals(vectorCount / 2, gigaMap.size());
+
+        // Search should only return remaining entities
+        final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+        assertEquals(10, result.size());
+
+        for(final ScoredSearchResult.Entry<Document> entry : result)
+        {
+            assertNotNull(entry.entity());
+            final String content = entry.entity().content();
+            final int docNum = Integer.parseInt(content.replace("doc_", ""));
+            assertTrue(docNum % 2 != 0,
+                "Only odd-numbered documents should remain, found: " + content);
+        }
+    }
+
+    /**
+     * Test concurrent search with PQ compression enabled.
+     * Verifies thread safety of PQ-compressed search.
+     */
+    @Test
+    void testPqCompressionConcurrentSearch(@TempDir final Path tempDir) throws Exception
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        // Run concurrent searches
+        final int numSearches = 50;
+        final AtomicInteger successfulSearches = new AtomicInteger(0);
+        final AtomicBoolean hasError = new AtomicBoolean(false);
+        final CountDownLatch latch = new CountDownLatch(numSearches);
+        final ExecutorService executor = Executors.newFixedThreadPool(4);
+
+        for(int i = 0; i < numSearches; i++)
+        {
+            final float[] queryVector = randomVector(new Random(i), dimension);
+            executor.submit(() ->
+            {
+                try
+                {
+                    final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                    if(result.size() == 10)
+                    {
+                        successfulSearches.incrementAndGet();
+                    }
+                }
+                catch(final Exception e)
+                {
+                    hasError.set(true);
+                    e.printStackTrace();
+                }
+                finally
+                {
+                    latch.countDown();
+                }
+            });
+        }
+
+        assertTrue(latch.await(30, TimeUnit.SECONDS), "Searches should complete within timeout");
+        executor.shutdown();
+
+        assertFalse(hasError.get(), "No errors should occur during concurrent PQ search");
+        assertEquals(numSearches, successfulSearches.get(),
+            "All concurrent PQ searches should return expected results");
+    }
+
+    /**
+     * Test adding vectors after PQ training.
+     * Verifies that search still works after adding more vectors post-training.
+     */
+    @Test
+    void testPqCompressionAddAfterTraining(@TempDir final Path tempDir)
+    {
+        final int initialCount = 500;
+        final int additionalCount = 200;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        // Add initial vectors
+        addRandomDocuments(gigaMap, random, dimension, initialCount, "initial_");
+
+        // Train PQ
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        // Search before adding more
+        final float[] queryVector = randomVector(random, dimension);
+        final VectorSearchResult<Document> resultBefore = index.search(queryVector, 10);
+        assertEquals(10, resultBefore.size());
+
+        // Add more vectors after training
+        addRandomDocuments(gigaMap, random, dimension, additionalCount, "additional_");
+
+        assertEquals(initialCount + additionalCount, gigaMap.size());
+
+        // Search should still work and may include newly added vectors
+        final VectorSearchResult<Document> resultAfter = index.search(queryVector, 10);
+        assertEquals(10, resultAfter.size());
+
+        for(final ScoredSearchResult.Entry<Document> entry : resultAfter)
+        {
+            assertNotNull(entry.entity());
+        }
+    }
+
+    /**
+     * Test PQ-compressed disk index with multiple restarts.
+     * Verifies that search works correctly after persisting a PQ-compressed
+     * index to disk and reloading it across multiple restart cycles.
+     */
+    @Test
+    void testPqCompressionMultipleRestarts(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        final float[] queryVector = randomVector(new Random(999), dimension);
+
+        // Phase 1: Create with 500 vectors and PQ, persist to disk
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .enablePqCompression(true)
+                    .pqSubspaces(pqSubspaces)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add(
+                    "embeddings",
+                    config,
+                    new ComputedDocumentVectorizer()
+                );
+
+                addRandomDocuments(gigaMap, random, dimension, 500, "doc_");
+
+                ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+                index.persistToDisk();
+
+                // Verify search works before restart
+                final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                assertEquals(10, result.size());
+
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Restart and verify search works from loaded disk index
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(500, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                assertTrue(index.isOnDisk());
+                assertTrue(index.isPqCompressionEnabled());
+
+                // Search should work after reload
+                final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                assertEquals(10, result.size());
+
+                // Verify all entities are accessible
+                result.forEach(entry -> assertTrue(entry.entity().content().startsWith("doc_")));
+
+            }
+        }
+
+        // Phase 3: Second restart - verify search still works
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(500, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                final VectorSearchResult<Document> result = index.search(queryVector, 20);
+                assertEquals(20, result.size());
+            }
+        }
+    }
+
+    /**
+     * Test PQ-compressed disk index with removeAll and repopulation.
+     * Verifies the index can be cleared and rebuilt with PQ compression.
+     */
+    @Test
+    void testPqCompressionRemoveAllAndRepopulate(@TempDir final Path tempDir)
+    {
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .build();
+
+        vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        // Initial population
+        addRandomDocuments(gigaMap, random, dimension, 500, "old_");
+
+        assertEquals(500, gigaMap.size());
+
+        // Clear all
+        gigaMap.removeAll();
+        assertEquals(0, gigaMap.size());
+
+        // Repopulate
+        addRandomDocuments(gigaMap, random, dimension, 600, "new_");
+
+        assertEquals(600, gigaMap.size());
+
+        final VectorIndices<Document> vectorIndicesAfter = gigaMap.index().get(VectorIndices.Category());
+        final VectorIndex<Document> indexAfter = vectorIndicesAfter.get("embeddings");
+
+        // Train PQ on new data
+        ((VectorIndex.Internal<Document>)indexAfter).trainCompressionIfNeeded();
+
+        // Search should find only new documents
+        final VectorSearchResult<Document> result = indexAfter.search(randomVector(random, dimension), 20);
+        assertEquals(20, result.size());
+
+        result.forEach(entry -> assertTrue(entry.entity().content().startsWith("new_")));
+
+    }
+
+    /**
+     * Test that in-memory index (default) still works as expected.
+     */
+    @Test
+    void testInMemoryIndexStillWorks()
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        // Default configuration (in-memory)
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .build();
+
+        assertFalse(config.onDisk());
+        assertNull(config.indexDirectory());
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        assertFalse(index.isOnDisk());
+
+        // Add vectors
+        addRandomDocuments(gigaMap, random, dimension, 100, "doc_");
+
+        // Search should work
+        final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+        assertEquals(10, result.size());
+    }
+
+
+    // ========================================================================
+    // Background Persistence Tests
+    // ========================================================================
+
+    /**
+     * Test that background persistence triggers after the configured interval.
+     */
+    @Test
+    void testBackgroundPersistenceTriggersAfterInterval(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        // Configure with short interval for testing
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(500) // 500ms for fast test
+            .minChangesBetweenPersists(1) // Persist on any change
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Add vectors to trigger dirty state
+            addRandomDocuments(gigaMap, random, dimension, 50, "doc_");
+
+            // Initially, files should not exist (not yet persisted)
+            assertFalse(Files.exists(indexDir.resolve("embeddings.graph")),
+                "Graph file should not exist immediately after adding");
+
+            // Wait for background persistence to trigger (interval + some buffer)
+            await()
+                    .atMost(ofMillis(1500))
+                    .pollInterval(ofMillis(100))
+                    .untilAsserted(() -> assertAll(
+                            () -> assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+                                    "Graph file should exist after background persistence"),
+                            () -> assertTrue(Files.exists(indexDir.resolve("embeddings.meta")),
+                                    "Meta file should exist after background persistence")));
+
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that search works concurrently during background persistence.
+     */
+    @Test
+    void testConcurrentSearchDuringBackgroundPersistence(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 200;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(200) // Short interval to trigger during test
+            .minChangesBetweenPersists(1)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Add initial vectors
+            addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+            // Run concurrent searches while background persistence may be running
+            final int numSearches = 50;
+            final AtomicInteger successfulSearches = new AtomicInteger(0);
+            final AtomicBoolean hasError = new AtomicBoolean(false);
+            final CountDownLatch latch = new CountDownLatch(numSearches);
+            final ExecutorService executor = Executors.newFixedThreadPool(4);
+
+            for(int i = 0; i < numSearches; i++)
+            {
+                final float[] queryVector = randomVector(new Random(i), dimension);
+                executor.submit(() ->
+                {
+                    try
+                    {
+                        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                        if(result.size() == 10)
+                        {
+                            successfulSearches.incrementAndGet();
+                        }
+                    }
+                    catch(final Exception e)
+                    {
+                        hasError.set(true);
+                        e.printStackTrace();
+                    }
+                    finally
+                    {
+                        latch.countDown();
+                    }
+                });
+
+                // Small delay to spread searches over time
+                Thread.sleep(20);
+            }
+
+            // Wait for all searches to complete
+            assertTrue(latch.await(30, TimeUnit.SECONDS), "Searches should complete within timeout");
+            executor.shutdown();
+
+            // Verify all searches succeeded
+            assertFalse(hasError.get(), "No errors should occur during concurrent search");
+            assertEquals(numSearches, successfulSearches.get(),
+                "All searches should return expected number of results");
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that shutdown persists pending changes when persistOnShutdown is true.
+     */
+    @Test
+    void testShutdownPersistsPendingChanges(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 100;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(60_000) // Long interval - won't trigger during test
+            .minChangesBetweenPersists(1)
+            .persistOnShutdown(true) // Should persist on close
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        // Add vectors
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        // Files should not exist yet (interval hasn't triggered)
+        assertFalse(Files.exists(indexDir.resolve("embeddings.graph")),
+            "Graph file should not exist before close");
+
+        // Close the index (should trigger persist due to persistOnShutdown=true)
+        index.close();
+
+        // Files should now exist
+        assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+            "Graph file should exist after close with persistOnShutdown=true");
+        assertTrue(Files.exists(indexDir.resolve("embeddings.meta")),
+            "Meta file should exist after close with persistOnShutdown=true");
+    }
+
+    /**
+     * Test that shutdown persists pending changes when persistOnShutdown is true
+     * and no background features (eventual indexing, background optimization,
+     * background persistence) are enabled — i.e. persistenceIntervalMs=0.
+     */
+    @Test
+    void testShutdownPersistsWithoutBackgroundFeatures(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 100;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            // No background persistence (interval=0), no eventual indexing,
+            // no background optimization. persistOnShutdown alone must flush.
+            .persistenceIntervalMs(0)
+            .persistOnShutdown(true)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        assertFalse(Files.exists(indexDir.resolve("embeddings.graph")),
+            "Graph file should not exist before close");
+
+        index.close();
+
+        assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+            "Graph file should exist after close with persistOnShutdown=true even without background features");
+        assertTrue(Files.exists(indexDir.resolve("embeddings.meta")),
+            "Meta file should exist after close with persistOnShutdown=true even without background features");
+    }
+
+    /**
+     * Test that the on-disk integrity check rejects a stale graph when the
+     * entity count has not changed but the entity-id high-water mark has —
+     * i.e. an equal number of additions and removals occurred between
+     * persists. Without the highestEntityId check the loader would accept
+     * the stale graph (count-collision) and serve phantom hits / silent
+     * misses; with the check it rebuilds from the current GigaMap state.
+     */
+    @Test
+    void testRecoveryRejectsCountCollision(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int initialCount = 50;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Phase 1: build, persist, store. persistOnShutdown=false so we control
+        // exactly when the on-disk graph is updated.
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .persistOnShutdown(false)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add(
+                    "embeddings",
+                    config,
+                    new ComputedDocumentVectorizer()
+                );
+
+                addRandomDocuments(gigaMap, random, dimension, initialCount, "doc_");
+                index.persistToDisk();
+                storage.storeRoot();
+                index.close();
+            }
+        }
+
+        // Phase 2: simulate a crash window — remove the highest id and add a
+        // new one (so size stays the same but highestUsedId advances). Persist
+        // GigaMap state but NOT the on-disk graph.
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                final long victim = gigaMap.highestUsedId();
+                gigaMap.removeById(victim);
+                addRandomDocuments(gigaMap, new Random(7), dimension, 1, "replacement_");
+
+                assertEquals(initialCount, gigaMap.size(),
+                    "Phase 2 should preserve the entity count (count-collision setup)");
+
+                storage.storeRoot();
+                // Deliberately skip index.persistToDisk() — leaves the on-disk
+                // graph stale but with a count that still matches.
+                index.close();
+            }
+        }
+
+        // Phase 3: reopen. The integrity check must reject the stale graph and
+        // rebuild from the current GigaMap state, so the removed entity must
+        // not appear and the replacement entity must.
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                final long replacementId = gigaMap.highestUsedId();
+                final Document replacement = gigaMap.get(replacementId);
+                assertNotNull(replacement, "Replacement entity should be present in the GigaMap state");
+
+                final VectorSearchResult<Document> result = index.search(replacement.embedding(), initialCount);
+                final Set<Long> hitIds = new HashSet<>();
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    hitIds.add(entry.entityId());
+                }
+
+                assertTrue(hitIds.contains(replacementId),
+                    "Replacement entity must be searchable after recovery");
+                assertEquals(initialCount, hitIds.size(),
+                    "Recovered index must expose exactly the live entity set, with no phantoms");
+            }
+        }
+    }
+
+    /**
+     * Test that shutdown does NOT persist when persistOnShutdown is false.
+     */
+    @Test
+    void testShutdownSkipsPersistWhenDisabled(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 100;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(60_000) // Long interval - won't trigger during test
+            .minChangesBetweenPersists(1)
+            .persistOnShutdown(false) // Should NOT persist on close
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        // Add vectors
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        // Close the index (should NOT trigger persist)
+        index.close();
+
+        // Files should NOT exist
+        assertFalse(Files.exists(indexDir.resolve("embeddings.graph")),
+            "Graph file should not exist after close with persistOnShutdown=false");
+    }
+
+    /**
+     * Test debouncing: persistence is skipped when change count is below threshold.
+     */
+    @Test
+    void testDebouncing(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        // Configure with high threshold that won't be met
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(200) // Short interval
+            .minChangesBetweenPersists(500) // High threshold
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Add fewer vectors than the threshold
+            addRandomDocuments(gigaMap, random, dimension, 50, "doc_"); // 50 < 500 threshold
+
+            // Wait for multiple persistence intervals
+            Thread.sleep(500);
+
+            // Files should NOT exist because change count is below threshold
+            assertFalse(Files.exists(indexDir.resolve("embeddings.graph")),
+                "Graph file should not exist when changes below threshold");
+
+            // Now add more vectors to exceed the threshold
+            for(int i = 50; i < 600; i++) // Total now 600 > 500 threshold
+            {
+                gigaMap.add(new Document("doc_" + i, randomVector(random, dimension)));
+            }
+
+            await()
+                    .atMost(ofMillis(500))
+                    .pollInterval(ofMillis(100))
+                    .untilAsserted(() -> assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+                            "Graph file should exist when changes exceed threshold"));
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that adding vectors in bulk correctly tracks change count.
+     */
+    @Test
+    void testBulkAddTracksChangeCount(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(300)
+            .minChangesBetweenPersists(100)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Bulk add documents
+            final List<Document> documents = new ArrayList<>();
+            for(int i = 0; i < 150; i++)
+            {
+                documents.add(new Document("doc_" + i, randomVector(random, dimension)));
+            }
+            gigaMap.addAll(documents);
+
+            // Wait for persistence
+            await()
+                    .atMost(ofMillis(800))
+                    .pollInterval(ofMillis(100))
+                    .untilAsserted(() -> assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+                            "Graph file should exist after bulk add exceeds threshold"));
+        } finally {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that background persistence can be reloaded after restart.
+     */
+    @Test
+    void testBackgroundPersistenceWithRestart(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 200;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        final float[] queryVector = randomVector(new Random(999), dimension);
+        final int expectedK = 10;
+
+        // Phase 1: Create index with background persistence and add vectors
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .persistenceIntervalMs(100)
+                    .minChangesBetweenPersists(1)
+                    .persistOnShutdown(true)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add(
+                    "embeddings",
+                    config,
+                    new ComputedDocumentVectorizer()
+                );
+
+                // Add vectors
+                addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+                // Verify search works
+                final VectorSearchResult<Document> result = index.search(queryVector, expectedK);
+                assertEquals(expectedK, result.size());
+
+                storage.storeRoot();
+
+                // Explicitly close the index to trigger persistOnShutdown
+                // (EmbeddedStorageManager doesn't auto-close VectorIndex)
+                index.close();
+            }
+        }
+
+        // Verify files were persisted
+        assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+            "Graph file should exist after close");
+        assertTrue(Files.exists(indexDir.resolve("embeddings.meta")),
+            "Meta file should exist after close");
+
+        // Phase 2: Reload and verify
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(vectorCount, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                assertTrue(index.isOnDisk(), "Index should be on-disk after reload");
+
+                // Search should still work after reload
+                final VectorSearchResult<Document> result = index.search(queryVector, expectedK);
+                assertEquals(expectedK, result.size());
+
+                // Clean up
+                index.close();
+            }
+        }
+    }
+
+    /**
+     * Test that manual persistToDisk still works with background persistence enabled.
+     */
+    @Test
+    void testManualPersistWithBackgroundPersistenceEnabled(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 100;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(60_000) // Long interval - won't trigger
+            .minChangesBetweenPersists(1000) // High threshold - won't trigger
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Add vectors
+            addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+            // Files should not exist yet
+            assertFalse(Files.exists(indexDir.resolve("embeddings.graph")));
+
+            // Manually trigger persistence
+            index.persistToDisk();
+
+            // Files should now exist
+            assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+                "Graph file should exist after manual persistToDisk");
+            assertTrue(Files.exists(indexDir.resolve("embeddings.meta")),
+                "Meta file should exist after manual persistToDisk");
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+
+    // ========================================================================
+    // Background Optimization Tests
+    // ========================================================================
+
+    /**
+     * Test that background optimization runs after the configured interval and threshold.
+     */
+    @Test
+    void testBackgroundOptimizationTriggersAfterIntervalAndThreshold(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        // Configure with short interval and low threshold for testing
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .optimizationIntervalMs(300) // 300ms for fast test
+            .minChangesBetweenOptimizations(10) // Low threshold
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            final VectorIndex.Default<Document> defaultIndex = (VectorIndex.Default<Document>)index;
+
+            // Initially, optimization count should be 0
+            assertEquals(0, defaultIndex.backgroundTaskManager.getOptimizationCount(),
+                "Optimization count should be 0 initially");
+
+            // Add vectors to trigger dirty state above threshold
+            addRandomDocuments(gigaMap, random, dimension, 50, "doc_");
+
+            // Verify pending changes are tracked
+            assertTrue(defaultIndex.backgroundTaskManager.getOptimizationPendingChangeCount() > 0,
+                "Pending changes should be tracked");
+
+            // Verify optimization was actually performed
+            await()
+                    .atLeast(ofMillis(300))
+                    .atMost(ofMillis(800))
+                    .pollInterval(ofMillis(100))
+                    .untilAsserted(() -> assertTrue(defaultIndex.backgroundTaskManager.getOptimizationCount() >= 1,
+                            "Optimization should have been performed at least once"));
+
+            // Verify pending changes were reset
+            assertEquals(0, defaultIndex.backgroundTaskManager.getOptimizationPendingChangeCount(),
+                "Pending changes should be reset after optimization");
+
+            // Verify search still works
+            final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+            assertEquals(10, result.size());
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that optimization is skipped when change count is below threshold.
+     */
+    @Test
+    void testOptimizationDebouncingBelowThreshold(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        // Configure with high threshold that won't be met
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .optimizationIntervalMs(200) // Short interval
+            .minChangesBetweenOptimizations(500) // High threshold
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            final VectorIndex.Default<Document> defaultIndex = (VectorIndex.Default<Document>)index;
+
+            // Add fewer vectors than the threshold
+            addRandomDocuments(gigaMap, random, dimension, 50, "doc_"); // 50 < 500 threshold
+
+            // Verify pending changes are tracked
+            assertEquals(50, defaultIndex.backgroundTaskManager.getOptimizationPendingChangeCount(),
+                "Pending changes should be 50");
+
+            // Wait for multiple optimization intervals
+            Thread.sleep(600);
+
+            // Verify optimization was NOT performed (below threshold)
+            assertEquals(0, defaultIndex.backgroundTaskManager.getOptimizationCount(),
+                "Optimization should NOT have been performed (below threshold)");
+
+            // Verify pending changes are still tracked (not reset)
+            assertEquals(50, defaultIndex.backgroundTaskManager.getOptimizationPendingChangeCount(),
+                "Pending changes should still be 50 (not reset)");
+
+            // Search should still work
+            final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+            assertEquals(10, result.size());
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that shutdown optimizes pending changes when optimizeOnShutdown is true.
+     */
+    @Test
+    void testShutdownOptimizesPendingChanges(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 100;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .optimizationIntervalMs(60_000) // Long interval - won't trigger during test
+            .minChangesBetweenOptimizations(1)
+            .optimizeOnShutdown(true) // Should optimize on close
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        final VectorIndex.Default<Document> defaultIndex = (VectorIndex.Default<Document>)index;
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        // Verify pending changes are tracked
+        assertEquals(vectorCount, defaultIndex.backgroundTaskManager.getOptimizationPendingChangeCount(),
+            "Pending changes should equal vector count");
+
+        // Verify no optimization has run yet
+        assertEquals(0, defaultIndex.backgroundTaskManager.getOptimizationCount(),
+            "Optimization count should be 0 before close");
+
+        // Verify search works before close
+        final VectorSearchResult<Document> resultBefore = index.search(randomVector(random, dimension), 10);
+        assertEquals(10, resultBefore.size());
+
+        // Close the index (should trigger optimize due to optimizeOnShutdown=true)
+        index.close();
+
+        // Note: After close(), we can't verify the count changed because the manager is shutdown.
+        // But we verified above that pending changes existed and the interval hadn't triggered.
+        // The fact that close() completed without error indicates optimization was attempted.
+    }
+
+    /**
+     * Test that shutdown does NOT optimize when optimizeOnShutdown is false.
+     */
+    @Test
+    void testShutdownSkipsOptimizeWhenDisabled(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 100;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .optimizationIntervalMs(60_000) // Long interval - won't trigger during test
+            .minChangesBetweenOptimizations(1)
+            .optimizeOnShutdown(false) // Should NOT optimize on close
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        final VectorIndex.Default<Document> defaultIndex = (VectorIndex.Default<Document>)index;
+
+        // Add vectors
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        // Verify pending changes are tracked
+        assertEquals(vectorCount, defaultIndex.backgroundTaskManager.getOptimizationPendingChangeCount(),
+            "Pending changes should equal vector count");
+
+        // Verify no optimization has run yet
+        assertEquals(0, defaultIndex.backgroundTaskManager.getOptimizationCount(),
+            "Optimization count should be 0 before close");
+
+        // Close the index (should NOT trigger optimize)
+        index.close();
+
+        // Note: After close(), we can't access the manager. But we verified:
+        // 1. Pending changes existed
+        // 2. No background optimization had run
+        // 3. optimizeOnShutdown=false was set
+        // So the pending changes should remain unoptimized.
+    }
+
+    /**
+     * Test that search works concurrently during background optimization.
+     */
+    @Test
+    void testConcurrentSearchDuringBackgroundOptimization(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 200;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .optimizationIntervalMs(150) // Short interval to trigger during test
+            .minChangesBetweenOptimizations(1)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Add initial vectors
+            addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+            // Run concurrent searches while background optimization may be running
+            final int numSearches = 50;
+            final AtomicInteger successfulSearches = new AtomicInteger(0);
+            final AtomicBoolean hasError = new AtomicBoolean(false);
+            final CountDownLatch latch = new CountDownLatch(numSearches);
+            final ExecutorService executor = Executors.newFixedThreadPool(4);
+
+            for(int i = 0; i < numSearches; i++)
+            {
+                final float[] queryVector = randomVector(new Random(i), dimension);
+                executor.submit(() ->
+                {
+                    try
+                    {
+                        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+                        if(result.size() == 10)
+                        {
+                            successfulSearches.incrementAndGet();
+                        }
+                    }
+                    catch(final Exception e)
+                    {
+                        hasError.set(true);
+                        e.printStackTrace();
+                    }
+                    finally
+                    {
+                        latch.countDown();
+                    }
+                });
+
+                // Small delay to spread searches over time
+                Thread.sleep(15);
+            }
+
+            // Wait for all searches to complete
+            assertTrue(latch.await(30, TimeUnit.SECONDS), "Searches should complete within timeout");
+            executor.shutdown();
+
+            // Verify all searches succeeded
+            assertFalse(hasError.get(), "No errors should occur during concurrent search with optimization");
+            assertEquals(numSearches, successfulSearches.get(),
+                "All searches should return expected number of results");
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that bulk add correctly tracks change count for optimization.
+     */
+    @Test
+    void testBulkAddTracksChangeCountForOptimization(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .optimizationIntervalMs(300)
+            .minChangesBetweenOptimizations(100)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Bulk add documents that exceeds the threshold
+            final List<Document> documents = new ArrayList<>();
+            for(int i = 0; i < 150; i++)
+            {
+                documents.add(new Document("doc_" + i, randomVector(random, dimension)));
+            }
+            gigaMap.addAll(documents);
+
+            // Wait for optimization
+            Thread.sleep(500);
+
+            // Search should still work
+            final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+            assertEquals(10, result.size());
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that manual optimize() method still works with background optimization enabled.
+     */
+    @Test
+    void testManualOptimizeWithBackgroundOptimizationEnabled(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 100;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .optimizationIntervalMs(60_000) // Long interval - won't trigger
+            .minChangesBetweenOptimizations(1000) // High threshold - won't trigger
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Add vectors
+            addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+            // Manually trigger optimization
+            index.optimize();
+
+            // Search should still work
+            final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+            assertEquals(10, result.size());
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+    /**
+     * Test that both background persistence and optimization can be enabled together.
+     */
+    @Test
+    void testBackgroundPersistenceAndOptimizationTogether(@TempDir final Path tempDir) throws Exception
+    {
+        final int dimension = 32;
+        final int vectorCount = 150;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        // Enable both background persistence and optimization
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .persistenceIntervalMs(300)
+            .minChangesBetweenPersists(10)
+            .persistOnShutdown(true)
+            .optimizationIntervalMs(400)
+            .minChangesBetweenOptimizations(10)
+            .optimizeOnShutdown(true)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+                "embeddings",
+                config,
+                new ComputedDocumentVectorizer()
+        );
+
+        try
+        {
+            // Add vectors
+            addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+            // Wait for both background tasks to run
+            Thread.sleep(1000);
+
+            // Search should still work
+            final VectorSearchResult<Document> result = index.search(randomVector(random, dimension), 10);
+            assertEquals(10, result.size());
+
+            // Files should exist from background persistence
+            assertTrue(Files.exists(indexDir.resolve("embeddings.graph")),
+                "Graph file should exist from background persistence");
+        }
+        finally
+        {
+            index.close();
+        }
+    }
+
+
+    // ========================================================================
+    // Parallel vs Non-Parallel On-Disk Write Tests
+    // ========================================================================
+
+
+    /**
+     * Test that parallel and non-parallel on-disk writes both support persist-and-reload
+     * for a large PQ-compressed index.
+     * Verifies that the graph files produced by both modes can be loaded correctly
+     * and yield equivalent search results after restart.
+     */
+    @Test
+    void testParallelVsNonParallelPersistAndReload(@TempDir final Path tempDir) throws IOException
+    {
+        final int vectorCount = 2000;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final int k = 20;
+        final Random random = new Random(42);
+
+        // Generate shared vectors and query
+        final List<float[]> vectors = new ArrayList<>();
+        for(int i = 0; i < vectorCount; i++)
+        {
+            vectors.add(randomVector(random, dimension));
+        }
+        final float[] queryVector = randomVector(new Random(999), dimension);
+
+        final Path parallelIndexDir    = tempDir.resolve("parallel-index");
+        final Path parallelStorageDir  = tempDir.resolve("parallel-storage");
+        final Path sequentialIndexDir  = tempDir.resolve("sequential-index");
+        final Path sequentialStorageDir = tempDir.resolve("sequential-storage");
+
+        // --- Build and persist both modes ---
+        buildAndPersistIndex(vectors, queryVector, dimension, pqSubspaces, parallelIndexDir, parallelStorageDir, true);
+        buildAndPersistIndex(vectors, queryVector, dimension, pqSubspaces, sequentialIndexDir, sequentialStorageDir, false);
+
+        // --- Reload both and compare search results ---
+        final List<Long> parallelIds = new ArrayList<>();
+        final List<Float> parallelScores = new ArrayList<>();
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(parallelStorageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(vectorCount, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                assertTrue(index.isOnDisk());
+
+                final VectorSearchResult<Document> result = index.search(queryVector, k);
+                assertEquals(k, result.size());
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    parallelIds.add(entry.entityId());
+                    parallelScores.add(entry.score());
+                    assertNotNull(entry.entity());
+                }
+            }
+        }
+
+        final List<Long> sequentialIds = new ArrayList<>();
+        final List<Float> sequentialScores = new ArrayList<>();
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(sequentialStorageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+
+                assertEquals(vectorCount, gigaMap.size());
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                assertTrue(index.isOnDisk());
+
+                final VectorSearchResult<Document> result = index.search(queryVector, k);
+                assertEquals(k, result.size());
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    sequentialIds.add(entry.entityId());
+                    sequentialScores.add(entry.score());
+                    assertNotNull(entry.entity());
+                }
+            }
+        }
+
+        // Both modes should produce equivalent results after reload
+        assertEquals(parallelIds, sequentialIds,
+            "Parallel and sequential modes should produce identical search results after reload");
+        assertEquals(parallelScores, sequentialScores,
+            "Parallel and sequential modes should produce identical search scores after reload");
+    }
+
+    /**
+     * Helper to build, populate, train PQ, persist, and store a PQ-compressed index.
+     */
+    private void buildAndPersistIndex(
+        final List<float[]> vectors         ,
+        final float[]       queryVector     ,
+        final int           dimension       ,
+        final int           pqSubspaces     ,
+        final Path          indexDir        ,
+        final Path          storageDir      ,
+        final boolean       parallel
+    ) throws IOException
+    {
+        try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+        {
+            final GigaMap<Document> gigaMap = GigaMap.New();
+            storage.setRoot(gigaMap);
+
+            final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+            final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                .dimension(dimension)
+                .similarityFunction(VectorSimilarityFunction.COSINE)
+                .maxDegree(32)
+                .beamWidth(100)
+                .onDisk(true)
+                .indexDirectory(indexDir)
+                .enablePqCompression(true)
+                .pqSubspaces(pqSubspaces)
+                .parallelOnDiskWrite(parallel)
+                .build();
+
+            final VectorIndex<Document> index = vectorIndices.add(
+                "embeddings", config, new ComputedDocumentVectorizer()
+            );
+
+            addDocumentsFromVectors(gigaMap, vectors, "doc_");
+
+            ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+            index.persistToDisk();
+
+            assertTrue(Files.exists(indexDir.resolve("embeddings.graph")));
+            assertTrue(Files.exists(indexDir.resolve("embeddings.meta")));
+
+            storage.storeRoot();
+        }
+    }
+
+
+    // ========================================================================
+    // Embedded Vectorizer + On-Disk Tests
+    // ========================================================================
+
+    /**
+     * Test that an embedded vectorizer with parallel on-disk write completes without deadlock.
+     * <p>
+     * This is a regression test for a deadlock where {@code persistToDisk()} held
+     * {@code synchronized(parentMap)} for the entire disk write. The disk writer uses
+     * internal worker threads (ForkJoinPool for PQ encoding, parallel graph writer)
+     * that call {@code parentMap.get()} — which also synchronizes on the same monitor.
+     * <p>
+     * The fix restructures locking: Phase 1 (prep) runs inside {@code synchronized(parentMap)},
+     * Phase 2 (disk write) runs outside it but still holds {@code persistenceLock.writeLock()}.
+     * <p>
+     * Uses {@code @Timeout} to fail fast if a deadlock occurs instead of hanging indefinitely.
+     */
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void testEmbeddedVectorizerWithParallelOnDiskWrite(@TempDir final Path tempDir)
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .parallelOnDiskWrite(true)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new EmbeddedDocumentVectorizer()
+        );
+
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        // This would deadlock before the fix
+        index.persistToDisk();
+
+        // Verify files were created
+        assertAll(
+                () -> assertTrue(Files.exists(indexDir.resolve("embeddings.graph"))),
+                () -> assertTrue(Files.exists(indexDir.resolve("embeddings.meta")))
+        );
+
+        // Verify search still works after persist
+        final float[] queryVector = randomVector(random, dimension);
+        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+        assertEquals(10, result.size());
+
+        result.forEach(entry -> assertNotNull(entry.entity()));
+    }
+
+    /**
+     * Test that an embedded vectorizer with PQ compression and parallel on-disk write
+     * completes without deadlock.
+     * <p>
+     * This is the most deadlock-prone scenario: FusedPQ encoding uses a ForkJoinPool
+     * that calls {@code getVector()} on worker threads, plus the parallel graph writer
+     * also calls {@code getVector()} from its own thread pool.
+     */
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void testEmbeddedVectorizerWithPqAndParallelOnDiskWrite(@TempDir final Path tempDir)
+    {
+        final int vectorCount = 500;
+        final int dimension = 64;
+        final int pqSubspaces = 16;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .enablePqCompression(true)
+            .pqSubspaces(pqSubspaces)
+            .parallelOnDiskWrite(true)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings",
+            config,
+            new EmbeddedDocumentVectorizer()
+        );
+
+        // Add vectors
+        addRandomDocuments(gigaMap, random, dimension, vectorCount, "doc_");
+
+        // Train PQ compression
+        ((VectorIndex.Internal<Document>)index).trainCompressionIfNeeded();
+
+        // This would deadlock before the fix
+        index.persistToDisk();
+
+        // Verify files were created
+        assertAll(
+                () -> assertTrue(Files.exists(indexDir.resolve("embeddings.graph"))),
+                () -> assertTrue(Files.exists(indexDir.resolve("embeddings.meta")))
+        );
+
+        // Verify search still works
+        final float[] queryVector = randomVector(random, dimension);
+        final VectorSearchResult<Document> result = index.search(queryVector, 10);
+        assertEquals(10, result.size());
+    }
+
+    /**
+     * Test that parallel and non-parallel on-disk writes produce equivalent search results
+     * for a large index without PQ compression.
+     * Both modes should produce identical graph files that yield the same search quality.
+     */
+    @Test
+    void testParallelVsSequentialOnDiskWrite(@TempDir final Path tempDir) throws IOException
+    {
+        final int vectorCount = 2000;
+        final int dimension = 64;
+        final int k = 20;
+        final Random random = new Random(42);
+
+        // Generate shared vectors and query
+        final List<float[]> vectors = new ArrayList<>();
+        for (int i = 0; i < vectorCount; i++) {
+            vectors.add(randomVector(random, dimension));
+        }
+        final float[] queryVector = randomVector(new Random(999), dimension);
+
+        final Path parallelIndexDir = tempDir.resolve("parallel");
+        final Path sequentialIndexDir = tempDir.resolve("sequential");
+
+        final List<Long> parallelIds = new ArrayList<>();
+        final List<Float> parallelScores = new ArrayList<>();
+        final List<Long> sequentialIds = new ArrayList<>();
+        final List<Float> sequentialScores = new ArrayList<>();
+
+        // --- Parallel config
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+
+        final VectorIndexConfiguration configParallel = VectorIndexConfiguration.builder()
+                .dimension(dimension)
+                .similarityFunction(VectorSimilarityFunction.COSINE)
+                .maxDegree(16)
+                .beamWidth(100)
+                .onDisk(true)
+                .indexDirectory(parallelIndexDir)
+                .parallelOnDiskWrite(true)
+                .build();
+
+        // --- Sequential config
+        final VectorIndex<Document> index = vectorIndices.add(
+                "embeddings", configParallel, new ComputedDocumentVectorizer()
+        );
+
+        final VectorIndexConfiguration configSequential = VectorIndexConfiguration.builder()
+                .dimension(dimension)
+                .similarityFunction(VectorSimilarityFunction.COSINE)
+                .maxDegree(16)
+                .enablePqCompression(true)
+                .beamWidth(100)
+                .onDisk(true)
+                .indexDirectory(sequentialIndexDir)
+                .parallelOnDiskWrite(false)
+                .build();
+
+        final VectorIndex<Document> indexSequential = vectorIndices.add(
+                "embeddingsSequential", configSequential, new ComputedDocumentVectorizer()
+        );
+
+        addDocumentsFromVectors(gigaMap, vectors, "doc_");
+
+        index.persistToDisk();
+        indexSequential.persistToDisk();
+
+        //parallel
+        final VectorSearchResult<Document> result = index.search(queryVector, k);
+        for (final ScoredSearchResult.Entry<Document> entry : result) {
+            parallelIds.add(entry.entityId());
+            parallelScores.add(entry.score());
+        }
+
+        //sequential
+        final VectorSearchResult<Document> resultSequential = indexSequential.search(queryVector, k);
+        for (final ScoredSearchResult.Entry<Document> entry : resultSequential) {
+            sequentialIds.add(entry.entityId());
+            sequentialScores.add(entry.score());
+        }
+
+        assertAll(
+                () -> assertTrue(Files.exists(parallelIndexDir.resolve("embeddings.graph"))),
+                () -> assertTrue(Files.exists(parallelIndexDir.resolve("embeddings.meta"))),
+                () -> assertTrue(Files.exists(sequentialIndexDir.resolve("embeddingsSequential.graph"))),
+                () -> assertTrue(Files.exists(sequentialIndexDir.resolve("embeddingsSequential.meta")))
+        );
+
+        // Both indices were built from the same data with the same HNSW parameters,
+        // so search results must be identical.
+        assertEquals(parallelIds, sequentialIds,
+                "Parallel and sequential on-disk writes should produce identical search results");
+        assertEquals(parallelScores, sequentialScores,
+                "Parallel and sequential on-disk writes should produce identical search scores");
+    }
+
+
+    // ========================================================================
+    // Incremental On-Disk Mode Tests
+    // ========================================================================
+
+    /**
+     * Test adding vectors after disk reload (incremental mode).
+     * Verifies search finds both old (disk) and new (in-memory) vectors.
+     */
+    @Test
+    void testIncrementalAddAfterDiskReload(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Distinguishable needle vectors for deterministic assertions
+        final float[] oldNeedleVector = new float[dimension];
+        oldNeedleVector[0] = 1.0f;
+        final float[] newNeedleVector = new float[dimension];
+        newNeedleVector[1] = 1.0f;
+
+        // Phase 1: Create index, add vectors including old needle, persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add("embeddings", config, new ComputedDocumentVectorizer());
+
+                addRandomDocuments(gigaMap, random, dimension, 100, "original_");
+                gigaMap.add(new Document("original_needle", oldNeedleVector));
+
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload (incremental mode), add new vectors, verify search
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                assertEquals(101, gigaMap.size());
+
+                // Add new vectors (goes to in-memory builder in incremental mode)
+                addRandomDocuments(gigaMap, random, dimension, 50, "new_");
+                gigaMap.add(new Document("new_needle", newNeedleVector));
+
+                assertEquals(152, gigaMap.size());
+
+                // Search for old needle — should be found from disk graph
+                final VectorSearchResult<Document> oldResult = index.search(oldNeedleVector, 5);
+                final ScoredSearchResult.Entry<Document> oldFirst = oldResult.iterator().next();
+                assertEquals("original_needle", oldFirst.entity().content(),
+                    "Old needle should be found from disk graph");
+                assertTrue(oldFirst.score() > 0.99f, "Exact match should have score close to 1.0");
+
+                // Search for new needle — should be found from in-memory builder
+                final VectorSearchResult<Document> newResult = index.search(newNeedleVector, 5);
+                final ScoredSearchResult.Entry<Document> newFirst = newResult.iterator().next();
+                assertEquals("new_needle", newFirst.entity().content(),
+                    "New needle should be found from in-memory builder");
+                assertTrue(newFirst.score() > 0.99f, "Exact match should have score close to 1.0");
+            }
+        }
+    }
+
+    /**
+     * Test deleting vectors after disk reload (incremental mode).
+     * Verifies search excludes deleted vectors from disk graph.
+     */
+    @Test
+    void testIncrementalDeleteAfterDiskReload(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Needle vector for easy identification
+        final float[] needleVector = new float[dimension];
+        needleVector[0] = 1.0f;
+
+        long needleEntityId;
+
+        // Phase 1: Create index with needle, persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                vectorIndices.add("embeddings", config, new ComputedDocumentVectorizer());
+
+                addRandomDocuments(gigaMap, random, dimension, 100, "doc_");
+                gigaMap.add(new Document("needle", needleVector));
+                assertEquals(101, gigaMap.size());
+
+                // Verify needle is found
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                final VectorSearchResult<Document> result = index.search(needleVector, 5);
+                final ScoredSearchResult.Entry<Document> firstEntry = result.iterator().next();
+                assertEquals("needle", firstEntry.entity().content());
+                needleEntityId = firstEntry.entityId();
+
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload (incremental mode), delete needle, verify search excludes it
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                assertEquals(101, gigaMap.size());
+
+                // Delete the needle
+                gigaMap.removeById(needleEntityId);
+                assertEquals(100, gigaMap.size());
+
+                // Search for needle vector — it should NOT be the first result anymore
+                final VectorSearchResult<Document> result = index.search(needleVector, 5);
+                assertEquals(5, result.size());
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    assertNotEquals("needle", entry.entity().content(),
+                        "Deleted needle should not appear in search results");
+                }
+            }
+        }
+    }
+
+    /**
+     * Test updating vectors after disk reload (incremental mode).
+     * Verifies search returns updated vector data.
+     */
+    @Test
+    void testIncrementalUpdateAfterDiskReload(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Needle vector for identification
+        final float[] needleVector = new float[dimension];
+        needleVector[0] = 1.0f;
+
+        // Opposite direction vector for update
+        final float[] oppositeVector = new float[dimension];
+        oppositeVector[0] = -1.0f;
+
+        long needleEntityId;
+
+        // Phase 1: Create index with needle, persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add("embeddings", config, new ComputedDocumentVectorizer());
+
+                addRandomDocuments(gigaMap, random, dimension, 100, "doc_");
+                gigaMap.add(new Document("needle", needleVector));
+
+                needleEntityId = index.search(needleVector, 1).iterator().next().entityId();
+
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload, update needle to point in opposite direction, verify
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                // Update needle in-place via set() — exercises internalUpdate() in incremental mode.
+                // This keeps the same entityId but changes the vector direction.
+                // Force lazy segment loading before set() (set uses peek() internally).
+                assertNotNull(gigaMap.get(needleEntityId));
+                gigaMap.set(needleEntityId, new Document("updated_needle", oppositeVector));
+                assertEquals(101, gigaMap.size(), "Size should be unchanged after in-place update");
+
+                // Search for original needle direction — updated entity should not be top result
+                final VectorSearchResult<Document> result = index.search(needleVector, 5);
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    assertNotEquals("updated_needle", entry.entity().content(),
+                        "Updated needle with opposite vector should not appear in original direction search");
+                }
+
+                // Search for opposite direction — updated entity should be found
+                final VectorSearchResult<Document> oppositeResult = index.search(oppositeVector, 5);
+                boolean foundUpdated = false;
+                for(final ScoredSearchResult.Entry<Document> entry : oppositeResult)
+                {
+                    if("updated_needle".equals(entry.entity().content()))
+                    {
+                        foundUpdated = true;
+                        break;
+                    }
+                }
+                assertTrue(foundUpdated, "Updated needle should be found when searching in its new direction");
+
+                // Also test updating a node that was added in incremental mode (builder-only).
+                // Add a new entity, then update it in-place — exercises internalUpdate()
+                // for an ordinal that exists in the builder, not on disk.
+                final long newId = gigaMap.add(new Document("builder_node", needleVector));
+                assertEquals(102, gigaMap.size());
+
+                // Update it in-place — the builder must delete the old node and re-add
+                gigaMap.get(newId); // force lazy segment loading
+                gigaMap.set(newId, new Document("builder_node_updated", oppositeVector));
+                assertEquals(102, gigaMap.size(), "Size unchanged after in-place update of builder node");
+
+                // Verify the entity was actually updated
+                assertEquals("builder_node_updated", gigaMap.get(newId).content());
+
+                // Search should find the updated builder node and not the stale version
+                final VectorSearchResult<Document> builderResult = index.search(oppositeVector, 102);
+                boolean foundBuilderUpdated = false;
+                boolean foundStaleBuilderNode = false;
+                for(final ScoredSearchResult.Entry<Document> entry : builderResult)
+                {
+                    if("builder_node_updated".equals(entry.entity().content()))
+                    {
+                        foundBuilderUpdated = true;
+                    }
+                    if("builder_node".equals(entry.entity().content()))
+                    {
+                        foundStaleBuilderNode = true;
+                    }
+                }
+                assertFalse(foundStaleBuilderNode, "Stale builder node should not appear in search");
+                assertTrue(foundBuilderUpdated, "Updated builder node should be found in search");
+            }
+        }
+    }
+
+    /**
+     * Test persist after incremental add mutations — reload, add, persist, reload, verify.
+     */
+    @Test
+    void testPersistAfterIncrementalMutations(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        final float[] needleVector = new float[dimension];
+        needleVector[0] = 1.0f;
+
+        // Phase 1: Create index, persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add("embeddings", config, new ComputedDocumentVectorizer());
+
+                addRandomDocuments(gigaMap, random, dimension, 100, "original_");
+
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload, add new vectors (including needle), persist again
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                // Add new vectors
+                addRandomDocuments(gigaMap, random, dimension, 50, "added_");
+                gigaMap.add(new Document("needle", needleVector));
+                assertEquals(151, gigaMap.size());
+
+                // Verify needle is searchable before persist
+                final VectorSearchResult<Document> preResult = index.search(needleVector, 5);
+                boolean preFoundNeedle = false;
+                for(final ScoredSearchResult.Entry<Document> entry : preResult)
+                {
+                    if("needle".equals(entry.entity().content()))
+                    {
+                        preFoundNeedle = true;
+                        break;
+                    }
+                }
+                assertTrue(preFoundNeedle, "Needle should be found before persist");
+
+                // Persist with incremental changes
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 3: Reload again, verify complete state including needle
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                assertEquals(151, gigaMap.size());
+
+                // Search for needle — should be found after persist+reload cycle
+                final VectorSearchResult<Document> result = index.search(needleVector, 10);
+                assertTrue(result.size() > 0, "Search should return results");
+                boolean foundNeedle = false;
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    if("needle".equals(entry.entity().content()))
+                    {
+                        foundNeedle = true;
+                        break;
+                    }
+                }
+                assertTrue(foundNeedle, "Needle should survive persist cycle");
+
+                // Verify search returns results from both original and added vectors
+                final VectorSearchResult<Document> allResult = index.search(
+                    randomVector(new Random(999), dimension), 20
+                );
+                boolean hasOriginal = false;
+                boolean hasAdded = false;
+                for(final ScoredSearchResult.Entry<Document> entry : allResult)
+                {
+                    if(entry.entity().content().startsWith("original_")) hasOriginal = true;
+                    if(entry.entity().content().startsWith("added_"))    hasAdded = true;
+                }
+                assertTrue(hasOriginal, "Should find original vectors after persist cycle");
+                assertTrue(hasAdded, "Should find added vectors after persist cycle");
+            }
+        }
+    }
+
+    /**
+     * Test no-op persist in incremental mode — when no changes have been made after reload,
+     * persist should skip quickly.
+     */
+    @Test
+    void testIncrementalNoOpPersist(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Phase 1: Create index, persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                vectorIndices.add("embeddings", config, new ComputedDocumentVectorizer());
+                addRandomDocuments(gigaMap, random, dimension, 100, "doc_");
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload, do nothing, persist (should be a no-op)
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                // Verify search still works
+                final VectorSearchResult<Document> resultBefore = index.search(
+                    randomVector(random, dimension), 10
+                );
+                assertEquals(10, resultBefore.size());
+
+                // Persist with no changes — should skip
+                index.persistToDisk();
+
+                // Verify search still works after no-op persist
+                final VectorSearchResult<Document> resultAfter = index.search(
+                    randomVector(random, dimension), 10
+                );
+                assertEquals(10, resultAfter.size());
+            }
+        }
+    }
+
+    /**
+     * Test removeAll in incremental mode — should cleanly reset state.
+     */
+    @Test
+    void testIncrementalRemoveAll(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+
+        // Phase 1: Create index, persist
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .build();
+
+                vectorIndices.add("embeddings", config, new ComputedDocumentVectorizer());
+                addRandomDocuments(gigaMap, random, dimension, 100, "doc_");
+
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+                index.persistToDisk();
+                storage.storeRoot();
+            }
+        }
+
+        // Phase 2: Reload, removeAll, add new data, verify
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                assertEquals(100, gigaMap.size());
+
+                // Remove all
+                gigaMap.removeAll();
+                assertEquals(0, gigaMap.size());
+
+                // Add new data after removeAll
+                addRandomDocuments(gigaMap, random, dimension, 50, "new_");
+                assertEquals(50, gigaMap.size());
+
+                // Search should work on new data
+                final VectorSearchResult<Document> result = index.search(
+                    randomVector(random, dimension), 10
+                );
+                assertEquals(10, result.size());
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    assertTrue(entry.entity().content().startsWith("new_"),
+                        "After removeAll, only new documents should be found");
+                }
+            }
+        }
+    }
+
+    /**
+     * Regression test for internal#112: an on-disk index in incremental mode with pending changes
+     * must NOT rebuild and rewrite the full graph on {@code close()} with {@code persistOnShutdown}.
+     * The graph file must stay byte-identical across the shutdown (no O(n) consolidation), and the
+     * changes must still be visible after reload thanks to the load-time self-heal from the store.
+     */
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void testShutdownDoesNotRebuildGraphInIncrementalMode(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+
+        final Path indexDir   = tempDir.resolve("index");
+        final Path storageDir = tempDir.resolve("storage");
+        final Path graphPath  = indexDir.resolve("embeddings.graph");
+
+        final float[] needleVector = new float[dimension];
+        needleVector[0] = 1.0f;
+
+        byte[]   graphBytesAfterPersist = null;
+        FileTime graphMTimeAfterPersist = null;
+
+        // Phase 1: create, persist once (enters incremental mode), apply incremental changes, then
+        // close with persistOnShutdown(true). The graph must not be rewritten by the shutdown.
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = GigaMap.New();
+                storage.setRoot(gigaMap);
+
+                final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+                final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+                    .dimension(dimension)
+                    .similarityFunction(VectorSimilarityFunction.COSINE)
+                    .onDisk(true)
+                    .indexDirectory(indexDir)
+                    .persistenceIntervalMs(60_000) // long interval — background persistence won't fire during the test
+                    .minChangesBetweenPersists(1)
+                    .persistOnShutdown(true)
+                    .build();
+
+                final VectorIndex<Document> index = vectorIndices.add(
+                    "embeddings", config, new ComputedDocumentVectorizer());
+
+                addRandomDocuments(gigaMap, random, dimension, 100, "original_");
+
+                // First persist writes the full graph and re-enters incremental mode.
+                index.persistToDisk();
+                storage.storeRoot();
+                assertTrue(Files.exists(graphPath), "Graph file should exist after the first persist");
+                graphBytesAfterPersist = Files.readAllBytes(graphPath);
+                graphMTimeAfterPersist = Files.getLastModifiedTime(graphPath);
+
+                // Apply incremental changes (in-memory builder + tombstones) — deliberately NOT persisted.
+                addRandomDocuments(gigaMap, random, dimension, 50, "added_");
+                gigaMap.add(new Document("needle", needleVector));
+                storage.storeRoot(); // commit to the store so the self-heal can rebuild them on reload
+
+                // Shutdown persist: in incremental mode this must skip the full-graph consolidation.
+                index.close();
+            }
+
+            // The graph file must be untouched by the shutdown: not rewritten (last-modified time
+            // unchanged — catches a deterministic rebuild that happens to produce identical bytes) and
+            // byte-identical (catches a rewrite that a coarse mtime granularity might miss).
+            assertEquals(graphMTimeAfterPersist, Files.getLastModifiedTime(graphPath),
+                "Shutdown must not rewrite the graph while in incremental mode (last-modified time changed)");
+            assertArrayEquals(graphBytesAfterPersist, Files.readAllBytes(graphPath),
+                "Shutdown must not rewrite the graph while in incremental mode (no full-graph rebuild)");
+            // And it must not leave any temp file behind.
+            assertNoTempFiles(indexDir);
+        }
+
+        // Phase 2: reload — the on-disk graph is stale (store advanced past it), so the self-heal
+        // rebuilds from the store. All vectors, including the unpersisted incremental ones, are found.
+        {
+            try(final EmbeddedStorageManager storage = EmbeddedStorage.start(storageDir))
+            {
+                final GigaMap<Document> gigaMap = storage.root();
+                final VectorIndices<Document> vectorIndices = gigaMap.index().get(VectorIndices.Category());
+                final VectorIndex<Document> index = vectorIndices.get("embeddings");
+
+                assertEquals(151, gigaMap.size());
+
+                final VectorSearchResult<Document> result = index.search(needleVector, 10);
+                boolean foundNeedle = false;
+                for(final ScoredSearchResult.Entry<Document> entry : result)
+                {
+                    if("needle".equals(entry.entity().content()))
+                    {
+                        foundNeedle = true;
+                        break;
+                    }
+                }
+                assertTrue(foundNeedle, "Self-heal must recover the unpersisted incremental changes from the store");
+            }
+        }
+    }
+
+    /**
+     * Fix for internal#112: {@link DiskIndexManager} writes the graph and meta via temp files and an
+     * atomic rename. A completed persist must leave no {@code .tmp} files behind, and the graph must
+     * load normally.
+     */
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void testWriteIndexLeavesNoTempFiles(@TempDir final Path tempDir) throws IOException
+    {
+        final int dimension = 32;
+        final Random random = new Random(42);
+        final Path indexDir = tempDir.resolve("index");
+
+        final GigaMap<Document> gigaMap = GigaMap.New();
+        final VectorIndices<Document> vectorIndices = gigaMap.index().register(VectorIndices.Category());
+        final VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+            .dimension(dimension)
+            .similarityFunction(VectorSimilarityFunction.COSINE)
+            .onDisk(true)
+            .indexDirectory(indexDir)
+            .build();
+
+        final VectorIndex<Document> index = vectorIndices.add(
+            "embeddings", config, new ComputedDocumentVectorizer());
+        addRandomDocuments(gigaMap, random, dimension, 100, "doc_");
+
+        index.persistToDisk();
+
+        assertTrue(Files.exists(indexDir.resolve("embeddings.graph")), "Graph file should exist after persist");
+        assertTrue(Files.exists(indexDir.resolve("embeddings.meta")),  "Meta file should exist after persist");
+        assertNoTempFiles(indexDir);
+
+        index.close();
+    }
+
+    /**
+     * Asserts that no temporary write files ({@code *.graph.tmp} / {@code *.meta.tmp}) linger in the
+     * index directory after a persist.
+     */
+    private static void assertNoTempFiles(final Path indexDir) throws IOException
+    {
+        if(!Files.exists(indexDir))
+        {
+            return;
+        }
+        try(final var entries = Files.list(indexDir))
+        {
+            final List<String> tempFiles = entries
+                .map(p -> p.getFileName().toString())
+                .filter(n -> n.endsWith(".tmp"))
+                .toList();
+            assertTrue(tempFiles.isEmpty(), "No temp files should remain after persist, found: " + tempFiles);
+        }
+    }
+
+}

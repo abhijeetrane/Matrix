@@ -1,0 +1,318 @@
+= JVector Configuration
+
+The `VectorIndexConfiguration` builder provides various options to tune the index for your specific use case.
+
+[#jvm-configuration]
+== JVM Configuration
+
+To enable SIMD acceleration via the Panama Vector API, configure your JVM with the following parameters.
+
+=== Required JVM Arguments
+
+[source, bash]
+----
+java --add-modules jdk.incubator.vector -jar your-app.jar
+----
+
+=== Full Example with Performance Tuning
+
+[source, bash]
+----
+java --add-modules jdk.incubator.vector \
+     -Djvector.physical_core_count=8 \
+     -jar your-app.jar
+----
+
+=== Maven Configuration
+
+For Maven projects, configure the Surefire and Failsafe plugins:
+
+[source, xml]
+----
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-surefire-plugin</artifactId>
+    <configuration>
+        <argLine>--add-modules jdk.incubator.vector</argLine>
+    </configuration>
+</plugin>
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-failsafe-plugin</artifactId>
+    <configuration>
+        <argLine>--add-modules jdk.incubator.vector</argLine>
+    </configuration>
+</plugin>
+----
+
+=== Gradle Configuration
+
+For Gradle projects:
+
+[source, kotlin]
+----
+tasks.withType<JavaExec> {
+    jvmArgs("--add-modules", "jdk.incubator.vector")
+}
+
+tasks.withType<Test> {
+    jvmArgs("--add-modules", "jdk.incubator.vector")
+}
+----
+
+=== Physical Core Configuration
+
+Intensive SIMD operations can saturate memory bandwidth during indexing and PQ computation. JVector mitigates this by using a `PhysicalCoreExecutor` that limits concurrency to physical cores rather than logical cores (hyperthreads).
+
+[options="header",cols="1,1,3"]
+|===
+|Property |Default |Description
+
+|`jvector.physical_core_count`
+|Half of available processors
+|Override the detected physical core count for parallel operations
+|===
+
+NOTE: The `jdk.incubator.vector` module is an incubator feature in Java 17-21. Starting with Java 22, the Vector API moved to preview status. JVector's multi-release JAR handles the API differences automatically, but the module must still be explicitly enabled.
+
+== Basic HNSW Parameters
+
+[options="header",cols="1,1,3"]
+|===
+|Parameter |Default |Description
+
+|`dimension`
+|(required)
+|Vector dimensionality. Must match the size of your embedding vectors.
+
+|`similarityFunction`
+|`COSINE`
+|Similarity metric (`COSINE`, `DOT_PRODUCT`, `EUCLIDEAN`).
+
+|`maxDegree`
+|16
+|Maximum connections per node in HNSW graph. Higher values improve recall but increase memory usage.
+
+|`beamWidth`
+|100
+|Beam width during index construction (HNSW _efConstruction_). Higher values improve graph quality but slow down construction. Has no effect at query time.
+
+|`minSearchBeamWidth`
+|100
+|Minimum beam width during search (HNSW _efSearch_ floor). The effective beam width is `max(k, minSearchBeamWidth)`. Keeps the top-k stable across different `k` values; set to `1` to disable the floor and make the beam width equal to the requested `k`. Independent of `beamWidth`. Can be overridden per query via `search(query, k, searchBeamWidth)`.
+
+|`neighborOverflow`
+|1.2
+|Overflow factor for neighbor lists.
+
+|`alpha`
+|1.2
+|Pruning parameter for the HNSW graph.
+|===
+
+=== Example
+
+[source, java]
+----
+VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+    .dimension(768)
+    .similarityFunction(VectorSimilarityFunction.COSINE)
+    .maxDegree(32)
+    .beamWidth(200)
+    .build();
+----
+
+== On-Disk Storage
+
+For datasets that exceed available memory, enable on-disk storage to use memory-mapped files. See xref:indexing/jvector/advanced.adoc#_on_disk_index_with_compression[On-Disk Index with Compression] for an in-depth explanation of the build/persist lifecycle, memory-mapped access, PQ compression theory, and the two-phase search with reranking.
+
+[options="header",cols="1,1,3"]
+|===
+|Parameter |Default |Description
+
+|`onDisk`
+|`false`
+|Enable on-disk graph storage.
+
+|`indexDirectory`
+|`null`
+|Directory for index files. Required if `onDisk=true`.
+
+|`enablePqCompression`
+|`false`
+|Enable Product Quantization compression.
+
+|`pqSubspaces`
+|`0`
+|Number of PQ subspaces (0 = auto: dimension/4).
+
+|`parallelOnDiskWrite`
+|`false`
+|Use parallel direct buffers and multiple worker threads for on-disk index writing. Speeds up persistence for large indices but uses more resources. Only applies when `onDisk=true`.
+|===
+
+=== Example
+
+[source, java]
+----
+VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+    .dimension(768)
+    .similarityFunction(VectorSimilarityFunction.COSINE)
+    .onDisk(true)
+    .indexDirectory(Path.of("/data/vectors"))
+    .enablePqCompression(true)
+    .pqSubspaces(48)  // Must divide dimension evenly
+    .build();
+----
+
+== Eventual Indexing
+
+Enable eventual indexing to defer expensive HNSW graph mutations to a background thread, reducing mutation latency at the cost of eventual search consistency.
+
+[options="header",cols="1,1,3"]
+|===
+|Parameter |Default |Description
+
+|`eventualIndexing`
+|`false`
+|Defer HNSW graph mutations (add, update, remove) to a background thread. The vector store is updated synchronously, but graph construction happens asynchronously. Search results may not immediately reflect the most recent mutations.
+|===
+
+When enabled:
+
+* The vector store is always updated synchronously (no data loss).
+* HNSW graph mutations are queued and applied by a single background worker thread.
+* The queue is automatically drained before `optimize()`, `persistToDisk()`, and `close()`.
+
+=== Example
+
+[source, java]
+----
+VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+    .dimension(768)
+    .similarityFunction(VectorSimilarityFunction.COSINE)
+    .eventualIndexing(true)
+    .build();
+----
+
+== Parallel On-Disk Writes
+
+When on-disk storage is enabled, persistence can optionally use parallel direct buffers and multiple worker threads (one per available processor) to write the index concurrently. This can significantly speed up persistence for large indices. See xref:indexing/jvector/advanced.adoc#_parallel_on_disk_writes[Parallel On-Disk Writes] in the advanced section for more details.
+
+This is disabled by default, as sequential single-threaded writing is preferred in resource-constrained environments or for smaller indices.
+
+=== Example
+
+[source, java]
+----
+VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+    .dimension(768)
+    .similarityFunction(VectorSimilarityFunction.COSINE)
+    .onDisk(true)
+    .indexDirectory(Path.of("/data/vectors"))
+    .parallelOnDiskWrite(true)
+    .build();
+----
+
+== Background Persistence
+
+Enable automatic asynchronous persistence to avoid blocking operations during writes.
+Setting `persistenceIntervalMs` to a value greater than 0 enables background persistence. See xref:indexing/jvector/advanced.adoc#_production_configuration[Production Configuration] for a combined example with background persistence and optimization.
+
+[options="header",cols="1,1,3"]
+|===
+|Parameter |Default |Description
+
+|`persistenceIntervalMs`
+|`0`
+|Check interval in milliseconds. A value > 0 enables background persistence, 0 disables it.
+
+|`minChangesBetweenPersists`
+|`100`
+|Minimum changes before persisting.
+
+|`persistOnShutdown`
+|`true`
+|Persist pending changes on `close()` when `onDisk=true`. Applies whether or not background persistence is enabled.
+|===
+
+=== Example
+
+[source, java]
+----
+VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+    .dimension(768)
+    .similarityFunction(VectorSimilarityFunction.COSINE)
+    .onDisk(true)
+    .indexDirectory(Path.of("/data/vectors"))
+    .persistenceIntervalMs(30_000)       // Enable, check every 30 seconds
+    .minChangesBetweenPersists(100)      // Only persist if >= 100 changes
+    .persistOnShutdown(true)             // Persist on close()
+    .build();
+----
+
+== Background Optimization
+
+Enable periodic graph optimization to maintain query performance as the index grows.
+Setting `optimizationIntervalMs` to a value greater than 0 enables background optimization. See xref:indexing/jvector/advanced.adoc#_manual_optimization_and_persistence[Manual Optimization and Persistence] for manual control.
+
+[options="header",cols="1,1,3"]
+|===
+|Parameter |Default |Description
+
+|`optimizationIntervalMs`
+|`0`
+|Check interval in milliseconds. A value > 0 enables background optimization, 0 disables it.
+
+|`minChangesBetweenOptimizations`
+|`1000`
+|Minimum changes before optimizing.
+
+|`optimizeOnShutdown`
+|`false`
+|Optimize pending changes on `close()`.
+|===
+
+=== Example
+
+[source, java]
+----
+VectorIndexConfiguration config = VectorIndexConfiguration.builder()
+    .dimension(768)
+    .similarityFunction(VectorSimilarityFunction.COSINE)
+    .onDisk(true)
+    .indexDirectory(Path.of("/data/vectors"))
+    .optimizationIntervalMs(60_000)       // Enable, check every 60 seconds
+    .minChangesBetweenOptimizations(1000) // Only optimize if >= 1000 changes
+    .optimizeOnShutdown(false)            // Skip for faster shutdown
+    .build();
+----
+
+== Parameter Guidelines
+
+The following table provides recommended parameter values based on dataset size.
+
+[options="header",cols="1,1,1,2"]
+|===
+|Use Case |maxDegree |beamWidth |Notes
+
+|Small dataset (<10K)
+|8-16
+|50-100
+|Lower values sufficient
+
+|Medium dataset (10K-1M)
+|16-32
+|100-200
+|Balanced trade-off
+
+|Large dataset (>1M)
+|32-64
+|200-400
+|Higher for better recall
+
+|High precision required
+|48-64
+|400-500
+|Maximum recall
+|===

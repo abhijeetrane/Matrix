@@ -1,0 +1,247 @@
+.eclair-analysis:
+  stage: analyze
+  tags:
+    - eclair-analysis
+  variables:
+    ECLAIR_OUTPUT_DIR: "ECLAIR_out"
+    ANALYSIS_KIND: "normal"
+    ENABLE_ECLAIR_BOT: "n"
+    AUTO_PR_BRANCH: "staging"
+    AUTO_PR_REPOSITORY: "xen-project/xen"
+    ECLAIR_ANALYSIS_RESULTS: "https://eclair-analysis-logs.xenproject.org"
+  script:
+    - ./automation/scripts/eclair 2>&1 | tee "${LOGFILE}"
+  artifacts:
+    when: always
+    paths:
+      - "${ECLAIR_OUTPUT_DIR}/*.log"
+      - "${ECLAIR_OUTPUT_DIR}/*.txt"
+      - '*.log'
+      - '*.json'
+      - intermediates/
+    reports:
+      codequality: gl-code-quality-report.json
+  rules:
+    - if: $WTOKEN == null
+      when: never
+    - when: always
+  needs: []
+
+.eclair-analysis:triggered:
+  extends: .eclair-analysis
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_JOB_NAME !~ $SELECTED_JOBS_ONLY
+      when: never
+    - if: $WTOKEN && $CI_PROJECT_PATH !~ /^xen-project\/hardware\//
+      when: manual
+      allow_failure: true
+    - !reference [.eclair-analysis, rules]
+
+eclair-x86_64-allcode:
+  extends: .eclair-analysis:triggered
+  variables:
+    LOGFILE: "eclair-x86_64.log"
+    VARIANT: "X86_64"
+    RULESET: "monitored"
+    EXTRA_XEN_CONFIG: |
+      CONFIG_ARGO=y
+      CONFIG_DEBUG_INFO=n
+      CONFIG_DEBUG_LOCK_PROFILE=y
+      CONFIG_DEBUG_TRACE=y
+      CONFIG_EFI_SET_VIRTUAL_ADDRESS_MAP=y
+      CONFIG_EXPERT=y
+      CONFIG_HYPERV_GUEST=y
+      CONFIG_LATE_HWDOM=y
+      CONFIG_MEM_PAGING=y
+      CONFIG_MEM_SHARING=y
+      CONFIG_PERF_ARRAYS=y
+      CONFIG_PERF_COUNTERS=y
+      CONFIG_PV32=y
+      CONFIG_SHADOW_PAGING=y
+      CONFIG_UNSUPPORTED=y
+      CONFIG_XEN_GUEST=y
+      CONFIG_XHCI=y
+      CONFIG_XSM=y
+
+eclair-x86_64-testing:
+  extends: eclair-x86_64-allcode
+  tags:
+    - eclair-analysis-testing
+  rules:
+    - if: $CI_PROJECT_PATH !~ /^xen-project\/people\/.*$/
+      when: never
+    - if: $ECLAIR_TESTING
+      when: always
+    - !reference [.eclair-analysis:triggered, rules]
+
+eclair-x86_64-amd:
+  extends: eclair-x86_64-allcode
+  tags:
+    - eclair-analysis-safety
+  allow_failure: false
+  variables:
+    EXTRA_XEN_CONFIG: |
+      CONFIG_AMD=y
+      CONFIG_INTEL=n
+      CONFIG_AMD_SVM=y
+      CONFIG_INTEL_VMX=n
+      CONFIG_NR_CPUS=16
+      CONFIG_NR_NUMA_NODES=2
+      CONFIG_PV=n
+      CONFIG_XEN_IBT=n
+      CONFIG_XEN_SHSTK=n
+      CONFIG_HVM_FEP=n
+      CONFIG_TBOOT=n
+      CONFIG_HYPFS=n
+      CONFIG_KEXEC=n
+      CONFIG_ARGO=y
+      CONFIG_SCHED_CREDIT=n
+      CONFIG_SCHED_RTDS=n
+      CONFIG_SCHED_ARINC653=n
+      CONFIG_LIVEPATCH=n
+      CONFIG_TRACEBUFFER=n
+      CONFIG_INTEL_IOMMU=n
+      CONFIG_EXPERT=y
+      CONFIG_DEBUG=y
+      CONFIG_DEBUG_INFO=n
+      CONFIG_GDBSX=n
+      CONFIG_FRAME_POINTER=n
+      CONFIG_SELF_TESTS=n
+      CONFIG_DEBUG_LOCKS=n
+      CONFIG_SCRUB_DEBUG=n
+      CONFIG_XMEM_POOL_POISON=n
+      CONFIG_MICROCODE_LOADING=n
+  rules:
+    - if: $ECLAIR_SAFETY
+      when: always
+    - !reference [.eclair-analysis:triggered, rules]
+
+eclair-ARM64-allcode:
+  extends: .eclair-analysis:triggered
+  variables:
+    LOGFILE: "eclair-ARM64.log"
+    VARIANT: "ARM64"
+    RULESET: "monitored"
+    EXTRA_XEN_CONFIG: |
+      CONFIG_ACPI=y
+      CONFIG_ARGO=y
+      CONFIG_ARM64_SVE=y
+      CONFIG_ARM_SMMU_V3=y
+      CONFIG_BOOT_TIME_CPUPOOLS=y
+      CONFIG_DEBUG_INFO=n
+      CONFIG_DEBUG_LOCK_PROFILE=y
+      CONFIG_DEBUG_TRACE=y
+      CONFIG_DEVICE_TREE_DEBUG=y
+      CONFIG_EFI_SET_VIRTUAL_ADDRESS_MAP=y
+      CONFIG_EXPERT=y
+      CONFIG_FFA=y
+      CONFIG_FFA_VM_TO_VM=y
+      CONFIG_GICV3_ESPI=y
+      CONFIG_HAS_ITS=y
+      CONFIG_IOREQ_SERVER=y
+      CONFIG_IPMMU_VMSA=y
+      CONFIG_LIVEPATCH=y
+      CONFIG_LLC_COLORING=y
+      CONFIG_OPTEE=y
+      CONFIG_OVERLAY_DTB=y
+      CONFIG_PCI_PASSTHROUGH=y
+      CONFIG_PERF_ARRAYS=y
+      CONFIG_PERF_COUNTERS=y
+      CONFIG_STACK_PROTECTOR=y
+      CONFIG_UNSUPPORTED=y
+      CONFIG_VM_EVENT=y
+      CONFIG_STATIC_MEMORY=y
+      CONFIG_STATIC_SHM=y
+      CONFIG_EARLY_UART_CHOICE_PL011=y
+      CONFIG_EARLY_UART_BASE_ADDRESS=0x0
+  allow_failure: false
+
+eclair-ARM64-testing:
+  extends: eclair-ARM64-allcode
+  tags:
+    - eclair-analysis-testing
+  rules:
+    - if: $CI_PROJECT_PATH !~ /^xen-project\/people\/.*$/
+      when: never
+    - if: $ECLAIR_TESTING
+      when: always
+    - !reference [.eclair-analysis:triggered, rules]
+
+eclair-ARM64-amd:
+  extends: eclair-ARM64-allcode
+  tags:
+    - eclair-analysis-safety
+  allow_failure: false
+  variables:
+    EXTRA_XEN_CONFIG: |
+      CONFIG_NR_CPUS=16
+      CONFIG_GICV2=n
+      CONFIG_GICV3=y
+      CONFIG_VGICV2=n
+      CONFIG_HAS_ITS=y
+      CONFIG_HWDOM_VUART=n
+      CONFIG_STATIC_SHM=y
+      CONFIG_STATIC_EVTCHN=y
+      CONFIG_STATIC_MEMORY=y
+      CONFIG_SCMI_SMC=n
+      CONFIG_PARTIAL_EMULATION=n
+      CONFIG_HYPFS=n
+      CONFIG_IOREQ_SERVER=y
+      CONFIG_XSM=n
+      CONFIG_ARGO=y
+      CONFIG_SCHED_CREDIT=n
+      CONFIG_SCHED_RTDS=n
+      CONFIG_SCHED_ARINC653=n
+      CONFIG_BOOT_TIME_CPUPOOLS=y
+      CONFIG_TRACEBUFFER=n
+      CONFIG_HAS_CADENCE_UART=n
+      CONFIG_HAS_NS16550=n
+      CONFIG_HAS_IMX_LPUART=n
+      CONFIG_HAS_MVEBU=n
+      CONFIG_HAS_MESON=n
+      CONFIG_HAS_OMAP=n
+      CONFIG_HAS_SCIF=n
+      CONFIG_HAS_LINFLEX=n
+      CONFIG_ARM_SMMU=n
+      CONFIG_ARM_SMMU_V3=y
+      CONFIG_EXPERT=y
+      CONFIG_DEBUG=y
+      CONFIG_DEBUG_INFO=n
+      CONFIG_FRAME_POINTER=n
+      CONFIG_SELF_TESTS=n
+      CONFIG_DEBUG_LOCKS=n
+      CONFIG_SCRUB_DEBUG=n
+      CONFIG_XMEM_POOL_POISON=n
+  rules:
+    - if: $ECLAIR_SAFETY
+      when: always
+    - !reference [.eclair-analysis:triggered, rules]
+
+.eclair-analysis:on-schedule:
+  extends: .eclair-analysis
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+      when: never
+    - if: $CI_JOB_NAME !~ $SELECTED_JOBS_ONLY
+      when: never
+    - !reference [.eclair-analysis, rules]
+
+eclair-x86_64-allrules:on-schedule:
+  extends: .eclair-analysis:on-schedule
+  variables:
+    VARIANT: "X86_64"
+    RULESET: "accepted"
+    ANALYSIS_KIND: "${RULESET}-scheduled"
+    LOGFILE: "eclair-${VARIANT}-${RULESET}.log"
+  allow_failure: true
+
+eclair-ARM64-allrules:on-schedule:
+  extends: .eclair-analysis:on-schedule
+  variables:
+    VARIANT: "ARM64"
+    RULESET: "accepted"
+    ANALYSIS_KIND: "${RULESET}-scheduled"
+    LOGFILE: "eclair-${VARIANT}-${RULESET}.log"
+  allow_failure: true

@@ -1,0 +1,201 @@
+= Index Types
+
+The GigaMap's bitmap index supports various index types.
+
+== "Normal" Index
+
+This is just a standard index that can include duplicate values. In fact, this is the most efficient type, as the bitmap index can compress this dataset and minimize memory overhead.
+
+[source, java]
+----
+// use the builder
+final GigaMap<Person> gigaMap = GigaMap.<Person>Builder()
+    .withBitmapIndex(PersonIndices.firstName)
+    .withBitmapIndex(PersonIndices.lastName)
+    ...
+    .build();
+
+// or register it after creating
+GigaMap<Person> gigaMap = GigaMap.New();
+gigaMap.index().bitmap().ensure(PersonIndices.firstName);
+gigaMap.index().bitmap().ensure(PersonIndices.lastName);
+...
+----
+
+== Identity Index
+
+An identity index is used exclusively to identify an entity within the GigaMap. It can consist of one or more indexers.
+
+When looking up or removing entities, the GigaMap doesn't traverse all data, as that would be too inefficient. Instead, it creates an internal query based on the identity index definitions to look up entries. If no identity index is provided, a compound one will be created using all standard indices.
+
+IMPORTANT: An identity index is **not** a unique index. It only defines which fields are used to identify entities — it does not enforce uniqueness. To enforce uniqueness, add a unique constraint as described in xref:constraints.adoc#_unique_constraints[Constraints].
+
+[source, java]
+----
+// use the builder
+final GigaMap<Person> gigaMap = GigaMap.<Person>Builder()
+    .withBitmapIdentityIndex(PersonIndices.id)
+    ...
+    .build();
+
+// or register it after creating
+GigaMap<Person> gigaMap = GigaMap.New();
+final BitmapIndices<E> bitmap = this.gigaMap.index().bitmap();
+bitmap.ensure(PersonIndices.id);             // add index first
+bitmap.setIdentityIndices(PersonIndices.id); // set as identity
+...
+----
+
+To make an identity index also enforce uniqueness, see xref:constraints.adoc#_unique_constraints[Unique Constraints].
+
+== Binary Index
+
+A special bitmap index designed for high cardinality.
+
+This index exclusively stores long values.
+
+Each long-bit corresponds to an entry, meaning there will be 64 entries max, no matter how high the cardinality becomes.
+
+Currently it only supports equality queries.
+Range queries are not supported yet.
+
+=== Zero and Negative Values
+
+All binary indexers support zero and negative values.
+Internally, each indexer maps the key to a non-zero long representation because the bitmap index uses bit positions as array indices, and a value of `0L` would have no bits set.
+
+For sub-64-bit types (`Byte`, `Short`, `Integer`, `Float`), this mapping is collision-free — no two distinct keys ever map to the same internal representation.
+
+`BinaryIndexerLong` uses `Long.MAX_VALUE` as the internal representation for zero.
+As a consequence, `Long.MAX_VALUE` is not supported as an index key and will throw an `IllegalArgumentException`.
+All other long values are fully supported.
+
+=== String Keys and the NUL Character
+
+`BinaryIndexerString` packs a string's UTF-8 bytes into long values and does not encode the byte length.
+Trailing `0x00` (NUL) bytes would therefore be indistinguishable from absent bytes, so `"alpha"` and `"alpha"` with a trailing NUL — or NUL-only strings of different length — could not be told apart.
+As a consequence, keys containing the NUL character (`U+0000`) are not supported and will throw an `IllegalArgumentException`. This applies to every operation that derives the index key from the value — adding, querying, and also updating or removing an entity (which re-index it to maintain the bitmap). The empty string and all other (NUL-free) strings are fully supported.
+
+WARNING: If you have an existing storage that already contains NUL-valued keys (written before this validation existed), not only adds and queries but also updates and removals of those entities will now throw, because they re-index the value. Normalize the affected values (see below) as part of your upgrade.
+
+If your input may contain NUL — for example fixed-width records padded with `\0`, or null-terminated buffers from native/JNI/FFI code — normalize it before indexing (cut at the terminator or strip NUL). Doing this explicitly at the input is preferable to a silent, partial normalization inside the index.
+
+The simplest place to normalize is in the indexer's value extractor, so the stored key is always NUL-free. Apply the *same* normalization to query keys (e.g. `nameIndex.is(cutAtNul(input))`) so a query matches what was stored:
+
+[source, java]
+----
+// Strategy 1: cut at the first NUL terminator (typical for null-terminated buffers)
+static String cutAtNul(final String s)
+{
+    final int nul = s.indexOf('\u0000');
+    return nul < 0 ? s : s.substring(0, nul);
+}
+
+// Strategy 2: remove every NUL character (typical for fixed-width padding)
+static String stripNul(final String s)
+{
+    return s.indexOf('\u0000') < 0 ? s : s.replace("\u0000", "");
+}
+
+// normalize inside the indexer so every stored key is NUL-free
+final BinaryIndexerString<Person> nameIndex = new BinaryIndexerString.Abstract<>()
+{
+    @Override
+    protected String getString(final Person person)
+    {
+        return cutAtNul(person.name());
+    }
+};
+
+// ... and normalize the query key the same way
+final List<Person> result = gigaMap.query(nameIndex.is(cutAtNul(userInput))).toList();
+----
+
+== Byte Index
+
+A composite bitmap index designed for high cardinality numeric types with range query support.
+
+It decomposes numbers into individual bytes (base 256) and stores each byte position as a separate sub-index with at most 256 entries. This uses the same composite index infrastructure as `IndexerLocalDate` (which decomposes into year/month/day).
+
+Byte indexers support both equality and range queries: `is`, `not`, `in`, `notIn`, `lessThan`, `lessThanEqual`, `greaterThan`, `greaterThanEqual`, and `between`.
+
+[source, java]
+----
+// use the builder
+final GigaMap<Product> gigaMap = GigaMap.<Product>Builder()
+    .withBitmapIdentityIndex(ProductIndices.price)
+    .build();
+
+// query with range conditions
+gigaMap.query(ProductIndices.price.between(10, 100));
+gigaMap.query(ProductIndices.price.greaterThan(50));
+----
+
+Use byte indexers when you need range queries on numeric types with high cardinality. Use binary indexers when you only need equality queries.
+
+== Choosing Between Regular, Binary, and Byte Indexers
+
+The bitmap index offers three families of indexers: **regular indexers** (e.g. `IndexerString`, `IndexerLong`), **binary indexers** (e.g. `BinaryIndexerString`, `BinaryIndexerLong`), and **byte indexers** (e.g. `ByteIndexerInt`, `ByteIndexerLong`). The right choice depends on your data characteristics and query needs.
+
+=== Comparison
+
+[options="header",cols="2,3,3,3"]
+|===
+|Aspect |Regular Indexer |Binary Indexer |Byte Indexer
+
+|Cardinality
+|Low to medium (few distinct values, many entities per value)
+|High (many distinct values, few entities per value)
+|High (many distinct values, few entities per value)
+
+|Query types
+|Equality (`is`, `in`), predicates (`is(predicate)`), and - depending on the index type - range queries
+|Equality only (`is`, `in`)
+|Equality (`is`, `in`, `not`, `notIn`) and range queries (`lessThan`, `greaterThan`, `between`, etc.)
+
+|Key type
+|Any object with `equals`/`hashCode`
+|Must convert to `long`
+|Numeric types and `Instant`
+
+|Memory
+|On-heap hash table
+|Off-heap bit-position array
+|Composite sub-indices with at most 256 entries per byte position
+
+|Null values
+|Native support footnote:[Exception: the Boolean index cannot distinguish `null` from `false` — both are absent from the `true` set. See the Boolean section under xref:queries/index.adoc[Queries].]
+|Requires sentinel value handling
+|Requires sentinel value handling
+
+|===
+
+=== Use Regular Indexer When
+
+* Indexed values have **low cardinality** — few distinct values shared by many entities (enums, categories, status fields)
+* You need **predicate-based queries**, e.g. `firstName.is(name -> name.startsWith("J"))`
+* You need **range queries** via `IndexerComparing`
+* The key type does not naturally map to `long`
+
+**Typical use cases:** enumerations, boolean flags, date/time fields, categories, multi-value fields
+
+=== Use Binary Indexer When
+
+* Indexed values have **high cardinality** — many distinct values (unique IDs, foreign keys)
+* Only **equality queries** are needed (`is`, `in`)
+* The key can be efficiently converted to `long` (numeric IDs, TSID, UUID)
+* **Memory efficiency** matters for large datasets
+
+**Typical use cases:** primary/foreign key indices, UUIDs, TSIDs, unique codes or reference numbers
+
+=== Use Byte Indexer When
+
+* Indexed values have **high cardinality** — many distinct values
+* You need **range queries** (`lessThan`, `greaterThan`, `between`, etc.) on high-cardinality data
+* The key is a **numeric type** or `Instant`
+* You want the benefits of bitmap indexing for high-cardinality fields without sacrificing range query support
+
+**Typical use cases:** prices, quantities, timestamps (as `Instant`), scores, measurements, or any numeric field that requires both high-cardinality support and range filtering
+
+
+

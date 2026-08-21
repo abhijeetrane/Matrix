@@ -1,0 +1,129 @@
+package org.eclipse.store.storage.restservice.javalin.types;
+
+/*-
+ * #%L
+ * EclipseStore Storage REST Service Javalin
+ * %%
+ * Copyright (C) 2023 - 2025 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+
+import org.eclipse.store.storage.restadapter.exceptions.StorageRestAdapterException;
+import org.eclipse.store.storage.restadapter.types.StorageRestAdapter;
+import org.eclipse.store.storage.restservice.javalin.exceptions.InvalidRouteParametersException;
+import org.eclipse.store.storage.restservice.types.StorageRestService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.javalin.Javalin;
+import io.javalin.config.JavalinConfig;
+import io.javalin.plugin.bundled.CorsPluginConfig;
+
+public class StorageRestServiceJavalinJava implements StorageRestService
+{
+
+	// Environment variable names
+	private static final String ENV_PORT = "eclipse_store_rest_port";
+	private static final String ENV_STORAGE_NAME = "eclipse_store_rest_storage_name";
+
+	// Default values
+	private static final int DEFAULT_PORT = 4567;
+	private static final String DEFAULT_STORAGE_NAME = "store-data";
+
+	Logger logger = LoggerFactory.getLogger(StorageRestServiceJavalinJava.class);
+
+	public static StorageRestServiceJavalinJava New(final StorageRestAdapter storageRestAdapter)
+	{
+		return new StorageRestServiceJavalinJava(storageRestAdapter);
+	}
+
+	private final StorageRestAdapter 	storageRestAdapter;
+	private Javalin 					javalin;
+	private final String                storageName;
+	private final int                   port;
+
+
+	public StorageRestServiceJavalinJava(StorageRestAdapter storageRestAdapter)
+	{
+		this.storageRestAdapter = storageRestAdapter;
+		this.port = resolvePort();
+		this.storageName = resolveStorageName();
+	}
+
+	@Override
+	public void start()
+	{
+		if (this.javalin == null) {
+			javalin = Javalin.create(config -> {
+				config.bundledPlugins.enableCors(cors -> cors.addRule(CorsPluginConfig.CorsRule::anyHost));
+				this.setupRoutes(config);
+			});
+		}
+		this.javalin.start(this.port);
+	}
+
+
+	private void setupRoutes(final JavalinConfig config)
+	{
+		final String base = "/" + this.storageName;
+
+		config.routes
+			.get(base + "/",                              new AllRoutesHandler(this.storageName))
+			.get(base + "/root",                          new RootHandler(storageRestAdapter))
+			.get(base + "/dictionary",                    new DictionaryHandler(storageRestAdapter))
+			.get(base + "/object/{oid}",                  new GetObjectHandler(storageRestAdapter))
+			.get(base + "/maintenance/filesStatistics",   new StorageFilesStatisticsHandler(storageRestAdapter))
+			.exception(InvalidRouteParametersException.class, (e, ctx) ->
+				ctx.status(404).result(e.getMessage())
+			)
+			.exception(StorageRestAdapterException.class, (e, ctx) ->
+				ctx.status(404).result(e.getMessage())
+			);
+	}
+
+	@Override
+	public void stop()
+	{
+		if (this.javalin != null)
+		{
+			this.javalin.stop();
+		}
+	}
+
+	private int resolvePort()
+	{
+		final String raw = System.getProperty(ENV_PORT);
+		if (raw != null) {
+			try {
+				final int p = Integer.parseInt(raw.trim());
+				if (p >= 1 && p <= 65535) {
+					return p;
+				}
+			} catch (NumberFormatException ignored) {
+				logger.error("Invalid port number in environment variable {}: {}, use default {}", ENV_PORT, raw, DEFAULT_PORT);
+			}
+		} else {
+			logger.trace("No environment variable {}, use default {}", ENV_PORT, DEFAULT_PORT);
+		}
+		return DEFAULT_PORT;
+	}
+
+	private String resolveStorageName()
+	{
+		final String raw = System.getProperty(ENV_STORAGE_NAME);
+		if (raw == null || raw.trim().isEmpty()) {
+			return DEFAULT_STORAGE_NAME;
+		} else {
+			logger.trace("No storage name environment variable {}, use default {}", ENV_STORAGE_NAME, DEFAULT_STORAGE_NAME);
+		}
+		return raw.trim();
+	}
+
+}

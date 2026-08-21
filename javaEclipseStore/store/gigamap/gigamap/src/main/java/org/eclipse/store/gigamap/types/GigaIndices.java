@@ -1,0 +1,879 @@
+package org.eclipse.store.gigamap.types;
+
+/*-
+ * #%L
+ * EclipseStore GigaMap
+ * %%
+ * Copyright (C) 2023 - 2025 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import org.eclipse.serializer.collections.BulkList;
+import org.eclipse.serializer.persistence.binary.types.BinaryTypeHandler;
+import org.eclipse.serializer.persistence.types.Storer;
+
+import java.io.Closeable;
+import java.io.IOException;
+
+import static org.eclipse.serializer.util.X.notNull;
+
+
+/**
+ * Represents a collection of indices within a {@link GigaMap}.
+ * Provides mechanisms for managing and retrieving bitmap indices,
+ * as well as other categorized or grouped indices.
+ *
+ * @param <E> the type of elements associated with this collection of indices
+ */
+public interface GigaIndices<E> extends GigaMap.Component<E>
+{
+	/**
+	 * Retrieves a BitmapIndices object associated with this GigaIndices instance.
+	 * This method provides access to the bitmap-based index for the current object.
+	 *
+	 * @return a BitmapIndices instance representing the bitmap index structure.
+	 */
+	public BitmapIndices<E> bitmap();
+	
+	/**
+	 * Retrieves the bitmap index associated with the specified name.
+	 *
+	 * @param name the name of the bitmap index to retrieve
+	 * @return the BitmapIndex object corresponding to the specified name
+	 */
+	public default BitmapIndex<E, ?> bitmap(final String name)
+	{
+		return this.bitmap().get(name);
+	}
+	
+	/**
+	 * Retrieves a specific BitmapIndex associated with the provided IndexIdentifier.
+	 * This method allows access to a bitmap index based on the key type and name
+	 * specified in the IndexIdentifier.
+	 *
+	 * @param <K>   the type of the key associated with the BitmapIndex
+	 * @param index the IndexIdentifier containing key type and name used to locate
+	 *              the desired bitmap index
+	 * @return a BitmapIndex corresponding to the specified IndexIdentifier
+	 */
+	public default <K> BitmapIndex<E, K> bitmap(final IndexIdentifier<E, K> index)
+	{
+		return this.bitmap().get(index.keyType(), index.name());
+	}
+	
+	/**
+	 * Retrieves an index group of the specified category type associated with the current instance.
+	 *
+	 * @param <C>      the type of the index group being retrieved
+	 * @param category the class of the index group category to retrieve
+	 * @return the index group of the specified category type
+	 */
+	public <C extends IndexGroup<E>> C get(Class<C> category);
+	
+	/**
+	 * Retrieves an index group associated with this instance and the specified category.
+	 * This method allows access to an index group based on the index category provided
+	 * as a parameter.
+	 *
+	 * @param <I>       the type of the index group being retrieved
+	 * @param category  the index category defining the type of index group to retrieve
+	 * @return the index group of the specified category type
+	 */
+	public <I extends IndexGroup<E>> I get(IndexCategory<E, I> category);
+	
+	/**
+	 * Adds a new index category to this GigaIndices instance.
+	 *
+	 * @param category the index category to be added, specified as an IndexCategory object
+	 *                 that defines the type of index group to associate with this instance.
+	 * @return {@code true} if the index category was successfully added,
+	 *         {@code false} if the category could not be added (e.g., if it already exists).
+	 */
+	public boolean add(IndexCategory<E, ?> category);
+	
+	/**
+	 * Registers an index group associated with the specified index category.
+	 * The method associates the given index category with this instance,
+	 * creating and initializing a new index group if necessary.
+	 *
+	 * @param <I>      the type of the index group to be registered
+	 * @param category the index category defining the type of index group to register
+	 * @return the registered index group corresponding to the specified category
+	 */
+	public <I extends IndexGroup<E>> I register(IndexCategory<E, I> category);
+
+	/**
+	 * Removes the index group of the given category from this {@link GigaMap}, dropping the whole
+	 * group and its data.
+	 * <p>
+	 * If the group implements {@link java.io.Closeable} (e.g. the Lucene full-text index), it is
+	 * closed first to release native resources such as file locks, readers and writers. Index data
+	 * held inside the object graph is reclaimed by the storage's garbage collection on the next
+	 * housekeeping cycle after the surrounding {@link GigaMap} is stored; index artifacts kept in an
+	 * external, application-managed directory on the file system are <b>not</b> deleted.
+	 * <p>
+	 * The core bitmap index group cannot be removed (it hosts the unique and custom constraints);
+	 * use {@link BitmapIndices#removeIndex(String)} to remove individual bitmap indices instead.
+	 *
+	 * @param category the category identifying the index group to remove
+	 * @return {@code true} if a matching group existed and was removed, {@code false} otherwise
+	 * @throws IllegalArgumentException if the targeted group is the core bitmap index group
+	 * @throws RuntimeException if the parent {@link GigaMap} is read-only
+	 */
+	public boolean remove(IndexCategory<E, ?> category);
+
+	/**
+	 * Removes the index group of the given type from this {@link GigaMap}.
+	 * <p>
+	 * For details see {@link #remove(IndexCategory)}.
+	 *
+	 * @param categoryType the type of the index group to remove
+	 * @return {@code true} if a matching group existed and was removed, {@code false} otherwise
+	 */
+	public boolean remove(Class<? extends IndexGroup<E>> categoryType);
+
+	/**
+	 * The Internals interface extends the GigaIndices interface to provide additional functionality
+	 * specifically related to managing internal operations and indices. This interface is meant
+	 * to define internal mechanics involved with handling indices while still providing access
+	 * to specific internal components.
+	 *
+	 * @param <E> The type of elements managed by the indices.
+	 */
+	public interface Internals<E> extends GigaIndices<E>
+	{
+		// this is actually not internal, but a public API method but with an internal return type. So no "internal~" prefix.
+		@Override
+		public BitmapIndices.Internal<E> bitmap();
+	}
+	
+	public final class Default<E> extends AbstractStateChangeFlagged implements Internals<E>
+	{
+		static BinaryTypeHandler<Default<?>> provideTypeHandler()
+		{
+			return BinaryHandlerGigaIndicesDefault.New();
+		}
+		
+		///////////////////////////////////////////////////////////////////////////
+		// instance fields //
+		////////////////////
+		
+		final GigaMap.Default<E> parent;
+
+		/*
+		 * Logic wise, this would be a HashTable, but it is preferable to use a list for the following reasons:
+		 * - very low number of entries (~1 to 10) can be iterated faster than hash-lookup-ed.
+		 * - having class instances as keys would complicate storing or require a special type handler
+		 * - hash lookup wouldn't suffice since quering for a interface type should still yield the suitable entry.
+		 */
+		final BulkList<IndexGroup.Internal<E>> indexGroups;
+					
+		
+		
+		///////////////////////////////////////////////////////////////////////////
+		// constructors //
+		/////////////////
+
+		Default(final GigaMap.Default<E> parent)
+		{
+			this(parent, BulkList.New(), true);
+		}
+		
+		Default(
+			final GigaMap.Default<E>               parent      ,
+			final BulkList<IndexGroup.Internal<E>> indexGroups ,
+			final boolean                          stateChanged
+		)
+		{
+			super(stateChanged);
+			this.parent      = parent     ;
+			this.indexGroups = indexGroups;
+		}
+		
+		
+		
+		///////////////////////////////////////////////////////////////////////////
+		// methods //
+		////////////
+		
+		@Override
+		public final GigaMap<E> parentMap()
+		{
+			return this.parent;
+		}
+
+		/**
+		 * Guards structural mutations against a parent {@link GigaMap} that is currently not mutable, applying
+		 * the same classification an entity write applies (see
+		 * {@link GigaMap.Internal#internalEnsureMutability()}): an explicit read-only mark, an in-progress
+		 * iteration and a self-held reader fail fast, while readers open on other threads are waited out.
+		 * <p>
+		 * Must be called while holding the parent-map monitor. <b>The call may release that monitor while
+		 * waiting</b>, so state read before it must be re-checked afterwards.
+		 *
+		 * @param operation description of the attempted change, used to build the error message
+		 */
+		private void ensureMutable(final String operation)
+		{
+			try
+			{
+				this.parent.internalEnsureMutability();
+			}
+			catch(final IllegalStateException e)
+			{
+				throw new IllegalStateException("Cannot " + operation + ": the GigaMap is not mutable.", e);
+			}
+		}
+
+		protected final void internalAdd(final long entityId, final E entity)
+		{
+			notNull(entity);
+			// mark in any case: a mid-loop throw from an indexer leaves already updated groups behind.
+			try
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					indexGroup.internalAdd(entityId, entity);
+				}
+			}
+			finally
+			{
+				this.markStateChangeChildren();
+			}
+		}
+
+		protected final void internalAddAll(final long firstEntityId, final Iterable<? extends E> entities)
+		{
+			try
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					indexGroup.internalAddAll(firstEntityId, entities);
+				}
+			}
+			finally
+			{
+				this.markStateChangeChildren();
+			}
+		}
+
+		protected final void internalRemove(final long entityId, final E entity)
+		{
+			/*
+			 * Best-effort removal across all index groups, mirroring BitmapIndices#internalRemove:
+			 * a throwing indexer in one group must not prevent the other groups from being cleaned
+			 * up. The first exception is rethrown at the end, subsequent failures are attached as
+			 * suppressed exceptions.
+			 */
+			RuntimeException first = null;
+			try
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					try
+					{
+						indexGroup.internalRemove(entityId, entity);
+					}
+					catch(final RuntimeException e)
+					{
+						if(first == null)
+						{
+							first = e;
+						}
+						else
+						{
+							first.addSuppressed(e);
+						}
+					}
+				}
+			}
+			finally
+			{
+				this.markStateChangeChildren();
+			}
+			if(first != null)
+			{
+				throw first;
+			}
+		}
+		
+		protected void internalRemoveAll()
+		{
+			for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+			{
+				indexGroup.internalRemoveAll();
+			}
+			this.markStateChangeChildren();
+		}
+
+		void internalReindex()
+		{
+			/*
+			 * Rebuild every index group from the current entity state. Each group clears its data and
+			 * re-indexes all entities of the parent map (see IndexGroup.Internal#internalReindex), so an
+			 * index that drifted out of sync - e.g. because an indexed entity was mutated directly instead
+			 * of via update()/apply() - is brought back in line.
+			 *
+			 * Best-effort across the groups, mirroring #internalRemove: a group that reports a problem with
+			 * the rebuilt data (the bitmap group rejects data violating a unique constraint) must neither
+			 * keep the remaining groups from being rebuilt nor cost the already rebuilt ones their
+			 * state-change marks - unmarked, a subsequent store() would not persist the rebuild at all. The
+			 * first exception is rethrown at the end, subsequent failures are attached as suppressed ones.
+			 */
+			RuntimeException first = null;
+			try
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					try
+					{
+						indexGroup.internalReindex(this.parent);
+					}
+					catch(final RuntimeException e)
+					{
+						if(first == null)
+						{
+							first = e;
+						}
+						else
+						{
+							first.addSuppressed(e);
+						}
+					}
+				}
+			}
+			finally
+			{
+				this.markStateChangeChildren();
+			}
+			if(first != null)
+			{
+				throw first;
+			}
+		}
+
+		void internalUpdateIndices(
+			final long                         entityId          ,
+			final E                            replacedEntity    ,
+			final E                            entity            ,
+			final CustomConstraints<? super E> customConstraints
+		)
+		{
+			try
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					indexGroup.internalPrepareIndicesUpdate(replacedEntity);
+					try
+					{
+						/*
+						 * The calling context (set/replace) keeps the replaced entity in place when the
+						 * update fails, so the previous index entries must remain untouched: no
+						 * internalRemovePreparedState here.
+						 */
+						indexGroup.internalUpdateIndices(entityId, replacedEntity, entity, customConstraints);
+					}
+					finally
+					{
+						indexGroup.internalFinishIndicesUpdate();
+					}
+				}
+			}
+			finally
+			{
+				this.markStateChangeChildren();
+			}
+		}
+
+		/**
+		 * First phase of an in-place entity update: derives the change handlers for the entity's
+		 * current (pre-mutation) state in all index groups. This runs all indexers, i.e. user code,
+		 * but does not mutate any index state: a throw here leaves the map completely unchanged,
+		 * already prepared groups are released again and nothing gets state-change marked.
+		 */
+		void internalPrepareUpdate(final E entity)
+		{
+			int prepared = 0;
+			try
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					indexGroup.internalPrepareIndicesUpdate(entity);
+					prepared++;
+				}
+			}
+			catch(final RuntimeException e)
+			{
+				int i = 0;
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					if(i++ >= prepared)
+					{
+						break;
+					}
+					try
+					{
+						indexGroup.internalFinishIndicesUpdate();
+					}
+					catch(final RuntimeException suppressed)
+					{
+						e.addSuppressed(suppressed);
+					}
+				}
+				throw e;
+			}
+		}
+
+		/**
+		 * Second phase of an in-place entity update: updates all index groups from the entity's state
+		 * as the update logic left it. Must be preceded by a successful
+		 * {@link #internalPrepareUpdate(Object)}.
+		 * <p>
+		 * If a group fails, the calling context decides whether the entity survives. It removes the
+		 * entity only if the exception rejects the entity itself instead of just the derived index (see
+		 * {@link GigaMap.Default#isEntityRejected(Throwable)}); that removal re-derives the keys from
+		 * the entity's mutated state, so the groups that did not get to update - the failing one and
+		 * all after it - de-index the entity's previous state here. The groups before the failing one
+		 * already carry the new state, which the removal locates by itself.
+		 */
+		void internalApplyUpdate(
+			final long                         entityId         ,
+			final E                            entity           ,
+			final CustomConstraints<? super E> customConstraints
+		)
+		{
+			int updated = 0;
+			try
+			{
+				try
+				{
+					for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+					{
+						indexGroup.internalUpdateIndices(entityId, entity, entity, customConstraints);
+						updated++;
+					}
+				}
+				catch(final RuntimeException e)
+				{
+					if(GigaMap.Default.isEntityRejected(e))
+					{
+						this.internalRemovePreparedState(entityId, updated, e);
+					}
+					this.internalFinishUpdate(e);
+					throw e;
+				}
+
+				this.internalFinishUpdate(null);
+			}
+			finally
+			{
+				this.markStateChangeChildren();
+			}
+		}
+
+		/**
+		 * Aligns the indices with an entity whose update logic threw: that entity's state is unreliable
+		 * and the calling context removes it, so the indices are updated from the entity's current
+		 * state to let the subsequent removal, which re-derives the keys from that same state, locate
+		 * all entries.
+		 * <p>
+		 * This runs best-effort per group so every group gets its chance to align; a group whose own
+		 * update fails de-indexes its previous entries via the prepared state instead and the failure
+		 * is attached to the logic's exception as a suppressed exception. Custom constraints are not
+		 * checked, the entity is doomed either way.
+		 */
+		void internalApplyLogicFailure(
+			final long             entityId    ,
+			final E                entity      ,
+			final RuntimeException logicFailure
+		)
+		{
+			try
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					try
+					{
+						indexGroup.internalUpdateIndices(entityId, entity, entity, null);
+					}
+					catch(final RuntimeException suppressed)
+					{
+						logicFailure.addSuppressed(suppressed);
+						try
+						{
+							indexGroup.internalRemovePreparedState(entityId);
+						}
+						catch(final RuntimeException alsoSuppressed)
+						{
+							logicFailure.addSuppressed(alsoSuppressed);
+						}
+					}
+				}
+				this.internalFinishUpdate(logicFailure);
+			}
+			finally
+			{
+				this.markStateChangeChildren();
+			}
+		}
+
+		/**
+		 * De-indexes the entity's previous state in all index groups from the given position on,
+		 * attaching failures to the given exception as suppressed exceptions.
+		 *
+		 * @param entityId the entity's id
+		 * @param skipCount the number of leading index groups that already carry the entity's new state
+		 * @param failure the exception that caused the cleanup
+		 */
+		private void internalRemovePreparedState(
+			final long             entityId ,
+			final int              skipCount,
+			final RuntimeException failure
+		)
+		{
+			int i = 0;
+			for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+			{
+				if(i++ < skipCount)
+				{
+					continue;
+				}
+				try
+				{
+					indexGroup.internalRemovePreparedState(entityId);
+				}
+				catch(final RuntimeException suppressed)
+				{
+					failure.addSuppressed(suppressed);
+				}
+			}
+		}
+
+		private void internalFinishUpdate(final RuntimeException primary)
+		{
+			RuntimeException first = primary;
+			for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+			{
+				try
+				{
+					indexGroup.internalFinishIndicesUpdate();
+				}
+				catch(final RuntimeException e)
+				{
+					if(first == null)
+					{
+						first = e;
+					}
+					else
+					{
+						first.addSuppressed(e);
+					}
+				}
+			}
+			if(primary == null && first != null)
+			{
+				throw first;
+			}
+		}
+					
+		final void internalReportIndexGroupStateChange(final IndexGroup<E> indexGroup)
+		{
+			// tiny consistency-helper to rule out method calls with null argument.
+			notNull(indexGroup);
+			
+			// simple default implementation ignores the precise instance reported, only the change itself.
+			this.markStateChangeChildren();
+		}
+														
+		@Override
+		public final BitmapIndices.Internal<E> bitmap()
+		{
+			@SuppressWarnings("unchecked")
+			final BitmapIndices.Internal<E> registered = this.get(BitmapIndices.Default.class);
+			
+			return registered;
+		}
+
+		@Override
+		public final <C extends IndexGroup<E>> C get(final Class<C> categoryType)
+		{
+			synchronized(this.parentMap())
+			{
+				// exact class match is checked first
+				for(final IndexGroup<E> indexGroup : this.indexGroups)
+				{
+					if(indexGroup.getClass() == categoryType)
+					{
+						return categoryType.cast(indexGroup);
+					}
+				}
+				
+				// if no exact class match was found, the general type is checked (e.g. passed interface type)
+				for(final IndexGroup<E> indexGroup : this.indexGroups)
+				{
+					if(categoryType.isAssignableFrom(indexGroup.getClass()))
+					{
+						return categoryType.cast(indexGroup);
+					}
+				}
+			}
+			
+			return null;
+		}
+		
+		@Override
+		public final <I extends IndexGroup<E>> I get(final IndexCategory<E, I> category)
+		{
+			synchronized(this.parentMap())
+			{
+				// exact class match is checked first
+				for(final IndexGroup<E> indexGroup : this.indexGroups)
+				{
+					if(indexGroup.getClass() == category.indexType())
+					{
+						return category.indexType().cast(indexGroup);
+					}
+				}
+				
+				// if no exact class match was found, the general type is checked (e.g. passed interface type)
+				for(final IndexGroup<E> indexGroup : this.indexGroups)
+				{
+					if(category.indexType().isAssignableFrom(indexGroup.getClass()))
+					{
+						return category.indexType().cast(indexGroup);
+					}
+				}
+			}
+			
+			return null;
+		}
+
+		@Override
+		public final boolean add(final IndexCategory<E, ?> category)
+		{
+			// concurrency handling done by called method
+			return this.register(category) != null;
+		}
+		
+		@Override
+		public final <I extends IndexGroup<E>> I register(final IndexCategory<E, I> category)
+		{
+			synchronized(this.parentMap())
+			{
+				this.ensureMutable("register an index group");
+
+				final IndexGroup.Internal<E> indexGroup = category.createIndexGroup(this.parent);
+				
+				@SuppressWarnings("unchecked")
+				final IndexGroup<E> alreadyRegistered = this.get(indexGroup.getClass());
+				if(alreadyRegistered != null)
+				{
+					return null;
+				}
+				
+				this.indexGroups.add(indexGroup);
+
+				// let the freshly added group back-fill itself from entities that already exist in the
+				// map (no-op for most groups; only reached for a newly-added group, see the early return
+				// above). Not invoked on deserialization, which reconstructs groups via their handlers.
+				try
+				{
+					indexGroup.internalOnRegistered();
+				}
+				catch(final Throwable e)
+				{
+					// keep registration atomic: a failed back-fill must not leave a half-initialized group
+					// registered. Roll back the addition and release native resources the group may hold.
+					this.indexGroups.removeOne(indexGroup);
+					if(indexGroup instanceof Closeable)
+					{
+						try
+						{
+							((Closeable)indexGroup).close();
+						}
+						catch(final IOException suppressed)
+						{
+							e.addSuppressed(suppressed);
+						}
+					}
+					throw e;
+				}
+
+				// mark the change only after the group is fully and successfully registered.
+				this.markStateChangeInstance();
+
+				return category.indexType().cast(indexGroup);
+			}
+		}
+
+		@Override
+		public final boolean remove(final IndexCategory<E, ?> category)
+		{
+			return this.internalRemoveGroup(category.indexType());
+		}
+
+		@Override
+		public final boolean remove(final Class<? extends IndexGroup<E>> categoryType)
+		{
+			return this.internalRemoveGroup(categoryType);
+		}
+
+		private boolean internalRemoveGroup(final Class<?> categoryType)
+		{
+			final IndexGroup.Internal<E> found;
+			synchronized(this.parentMap())
+			{
+				this.ensureMutable("remove index group \"" + categoryType.getName() + "\"");
+
+				IndexGroup.Internal<E> match = null;
+				// exact class match is checked first, then the general (e.g. interface) type, mirroring #get.
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					if(indexGroup.getClass() == categoryType)
+					{
+						match = indexGroup;
+						break;
+					}
+				}
+				if(match == null)
+				{
+					for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+					{
+						if(categoryType.isAssignableFrom(indexGroup.getClass()))
+						{
+							match = indexGroup;
+							break;
+						}
+					}
+				}
+				if(match == null)
+				{
+					return false;
+				}
+				if(match instanceof BitmapIndices)
+				{
+					throw new IllegalArgumentException(
+						"The bitmap index group cannot be removed (it hosts the unique and custom constraints); "
+						+ "use BitmapIndices#removeIndex(String) to remove individual bitmap indices."
+					);
+				}
+				found = match;
+			}
+
+			// Release resources outside the parentMap monitor: a group's close() may acquire its own internal
+			// lock (e.g. a vector index's builder write-lock) while a background task holds that lock and waits
+			// for the parentMap monitor, so closing under the monitor could dead-lock. Drop the group from the
+			// registry only after close() succeeds, so a failing close leaves it registered (and re-closeable)
+			// rather than detached-but-unclosed.
+			if(found instanceof Closeable)
+			{
+				try
+				{
+					((Closeable)found).close();
+				}
+				catch(final IOException e)
+				{
+					throw new RuntimeException(
+						"Failed to close index group \"" + found.getClass().getName() + "\" while removing it.",
+						e
+					);
+				}
+			}
+
+			synchronized(this.parentMap())
+			{
+				this.indexGroups.removeOne(found);
+				this.markStateChangeInstance();
+			}
+			return true;
+		}
+
+		/**
+		 * Closes every {@link Closeable} index group, releasing background threads and auxiliary
+		 * resources, <b>without</b> removing the groups or mutating persistent state. Invoked when the
+		 * owning storage is shut down (see {@link GigaMap.Default#releaseOnShutdown()}). Best-effort: a
+		 * failure of one group does not prevent the others from being closed; the first failure is
+		 * rethrown (with the rest suppressed) once all groups have been attempted.
+		 * <p>
+		 * The closeable groups are collected under the {@code parentMap} monitor but closed <b>outside</b>
+		 * of it: a group's {@code close()} may acquire its own internal lock (e.g. a vector index's builder
+		 * write-lock) while a background task holds that lock and waits for the {@code parentMap} monitor,
+		 * so holding the monitor across {@code close()} would dead-lock.
+		 */
+		final void closeAllGroups()
+		{
+			final BulkList<Closeable> closeables = BulkList.New();
+			synchronized(this.parentMap())
+			{
+				for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+				{
+					if(indexGroup instanceof Closeable)
+					{
+						closeables.add((Closeable)indexGroup);
+					}
+				}
+			}
+
+			RuntimeException problem = null;
+			for(final Closeable closeable : closeables)
+			{
+				try
+				{
+					closeable.close();
+				}
+				catch(final Exception e)
+				{
+					if(problem == null)
+					{
+						problem = new RuntimeException(
+							"Failed to close one or more index groups on storage shutdown.",
+							e
+						);
+					}
+					else
+					{
+						problem.addSuppressed(e);
+					}
+				}
+			}
+			if(problem != null)
+			{
+				throw problem;
+			}
+		}
+
+		@Override
+		protected final void clearChildrenStateChangeMarkers()
+		{
+			this.indexGroups.iterate(IndexGroup.Internal::clearStateChangeMarkers);
+		}
+		
+		@Override
+		protected void storeChildren(final Storer storer)
+		{
+			// this is just a local, partial lock that does NOT protect the whole giga map storing process. See GigaMap#store.
+			synchronized(this.parentMap())
+			{
+				super.storeChildren(storer);
+			}
+		}
+						
+		@Override
+		protected final void storeChangedChildren(final Storer storer)
+		{
+			for(final IndexGroup.Internal<E> indexGroup : this.indexGroups)
+			{
+				// must take a detour over the TypeHandler because of interface typing
+				storer.store(indexGroup);
+			}
+		}
+		
+	}
+			
+}

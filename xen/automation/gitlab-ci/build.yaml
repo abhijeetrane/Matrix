@@ -1,0 +1,834 @@
+.build-tmpl: &build
+  stage: build
+  image: ${XEN_REGISTRY}/${CONTAINER}
+  script:
+    - ./automation/scripts/build 2>&1 | tee build.log
+  artifacts:
+    paths:
+      - binaries/
+      - intermediates/
+      - xen-config
+      - xen-cppcheck.txt
+      - '*.log'
+      - '*/*.log'
+    when: always
+  needs: []
+  rules:
+    - if: $BUILD_FOR_TESTS_ONLY
+      when: never
+    - if: $CI_JOB_NAME =~ $SELECTED_JOBS_ONLY
+      when: on_success
+
+# override BUILD_FOR_TESTS_ONLY exclusion
+.build-test-tpl: &build-test
+  rules:
+    - if: $CI_JOB_NAME =~ $SELECTED_JOBS_ONLY
+      when: on_success
+
+.gcc-tmpl:
+  variables: &gcc
+    CC: gcc
+    CXX: g++
+
+.clang-tmpl:
+  variables: &clang
+    CC: clang
+    CXX: clang++
+    clang: y
+
+.x86_64-build-tmpl:
+  <<: *build
+  variables:
+    XEN_TARGET_ARCH: x86_64
+  tags:
+    - x86_64
+
+.x86_64-build:
+  extends: .x86_64-build-tmpl
+  variables:
+    debug: n
+
+.x86_64-build-debug:
+  extends: .x86_64-build-tmpl
+  variables:
+    debug: y
+
+.x86_32-build-tmpl:
+  <<: *build
+  variables:
+    XEN_TARGET_ARCH: x86_32
+  tags:
+    - x86_32
+
+.x86_32-build:
+  extends: .x86_32-build-tmpl
+  variables:
+    debug: n
+
+.x86_32-build-debug:
+  extends: .x86_32-build-tmpl
+  variables:
+    debug: y
+
+.gcc-x86_64-build:
+  extends: .x86_64-build
+  variables:
+    <<: *gcc
+
+.gcc-x86_64-build-debug:
+  extends: .x86_64-build-debug
+  variables:
+    <<: *gcc
+
+.gcc-x86_32-build:
+  extends: .x86_32-build
+  variables:
+    <<: *gcc
+
+.gcc-x86_32-build-debug:
+  extends: .x86_32-build-debug
+  variables:
+    <<: *gcc
+
+.clang-x86_64-build:
+  extends: .x86_64-build
+  variables:
+    <<: *clang
+
+.clang-x86_64-build-debug:
+  extends: .x86_64-build-debug
+  variables:
+    <<: *clang
+
+.clang-x86_32-build:
+  extends: .x86_32-build
+  variables:
+    <<: *clang
+
+.clang-x86_32-build-debug:
+  extends: .x86_32-build-debug
+  variables:
+    <<: *clang
+
+.arm32-cross-build-tmpl:
+  <<: *build
+  variables:
+    XEN_TARGET_ARCH: arm32
+  tags:
+    - arm64
+
+.arm32-cross-build:
+  extends: .arm32-cross-build-tmpl
+  variables:
+    debug: n
+
+.arm32-cross-build-debug:
+  extends: .arm32-cross-build-tmpl
+  variables:
+    debug: y
+
+.gcc-arm32-cross-build:
+  extends: .arm32-cross-build
+  variables:
+    <<: *gcc
+
+.gcc-arm32-cross-build-debug:
+  extends: .arm32-cross-build-debug
+  variables:
+    <<: *gcc
+
+.arm64-build-tmpl:
+  <<: *build
+  variables:
+    XEN_TARGET_ARCH: arm64
+  tags:
+    - arm64
+
+.arm64-build:
+  extends: .arm64-build-tmpl
+  variables:
+    debug: n
+
+.arm64-build-debug:
+  extends: .arm64-build-tmpl
+  variables:
+    debug: y
+
+.gcc-arm64-build:
+  extends: .arm64-build
+  variables:
+    <<: *gcc
+
+.gcc-arm64-build-debug:
+  extends: .arm64-build-debug
+  variables:
+    <<: *gcc
+
+.riscv64-cross-build-tmpl:
+  <<: *build
+  variables:
+    XEN_TARGET_ARCH: riscv64
+  tags:
+    - x86_64
+
+.riscv64-cross-build:
+  extends: .riscv64-cross-build-tmpl
+  variables:
+    debug: n
+
+.riscv64-cross-build-debug:
+  extends: .riscv64-cross-build-tmpl
+  variables:
+    debug: y
+
+.gcc-riscv64-cross-build:
+  extends: .riscv64-cross-build
+  variables:
+    <<: *gcc
+
+.gcc-riscv64-cross-build-debug:
+  extends: .riscv64-cross-build-debug
+  variables:
+    <<: *gcc
+
+.ppc64le-cross-build-tmpl:
+  <<: *build
+  variables:
+    XEN_TARGET_ARCH: ppc64
+  tags:
+    - x86_64
+
+.ppc64le-cross-build:
+  extends: .ppc64le-cross-build-tmpl
+  variables:
+    debug: n
+
+.ppc64le-cross-build-debug:
+  extends: .ppc64le-cross-build-tmpl
+  variables:
+    debug: y
+
+.gcc-ppc64le-cross-build:
+  extends: .ppc64le-cross-build
+  variables:
+    <<: *gcc
+
+.gcc-ppc64le-cross-build-debug:
+  extends: .ppc64le-cross-build-debug
+  variables:
+    <<: *gcc
+
+.yocto-test:
+  stage: build
+  image: ${XEN_REGISTRY}/${CONTAINER}
+  script:
+    - ./automation/build/yocto/build-yocto.sh -v --log-dir=./logs --xen-dir=`pwd` ${YOCTO_BOARD} ${YOCTO_OUTPUT}
+  variables:
+    YOCTO_VERSION: scarthgap
+    CONTAINER: yocto:${YOCTO_VERSION}-${YOCTO_BOARD}${YOCTO_HOST}
+  artifacts:
+    paths:
+      - 'logs/*'
+      - binaries/
+    when: always
+  needs: []
+  rules:
+    - if: $CI_JOB_NAME =~ $SELECTED_JOBS_ONLY
+      when: manual
+      allow_failure: true
+
+.yocto-test-arm64:
+  extends: .yocto-test
+  variables:
+    YOCTO_HOST: -arm64v8
+  tags:
+    - arm64
+
+.yocto-test-x86_64:
+  extends: .yocto-test
+  tags:
+    - x86_64
+
+.x86_64-cross-build-tmpl:
+  <<: *build
+  variables:
+    XEN_TARGET_ARCH: x86_64
+  tags:
+    - arm64
+
+.x86_64-cross-build:
+  extends: .x86_64-cross-build-tmpl
+  variables:
+    debug: n
+
+.gcc-x86_64-cross-build:
+  extends: .x86_64-cross-build
+  variables:
+    <<: *gcc
+
+# Jobs below this line
+
+# Build jobs needed for tests
+
+alpine-3.24-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-x86_64
+
+alpine-3.24-x86_64-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-x86_64
+    BUILD_QEMU_XEN: y
+    EXTRA_XEN_CONFIG: |
+      CONFIG_EXPERT=y
+      CONFIG_UNSUPPORTED=y
+      CONFIG_ARGO=y
+      CONFIG_UBSAN=y
+      CONFIG_UBSAN_FATAL=y
+      CONFIG_MICROCODE_SCAN_DEFAULT=y
+      CONFIG_XHCI=y
+
+debian-13-x86_64-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: debian:13-x86_64
+    EXTRA_XEN_CONFIG: |
+      CONFIG_SHADOW_PAGING=y
+
+debian-13-x86_64-clang-debug:
+  extends: .clang-x86_64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: debian:13-x86_64
+    EXTRA_XEN_CONFIG: |
+      CONFIG_SHADOW_PAGING=y
+
+debian-13-ppc64le-gcc-debug:
+  extends: .gcc-ppc64le-cross-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: debian:13-ppc64le
+    KBUILD_DEFCONFIG: ppc64_defconfig
+    HYPERVISOR_ONLY: y
+    EXTRA_XEN_CONFIG: |
+      CONFIG_UBSAN=y
+      CONFIG_UBSAN_FATAL=y
+
+debian-13-riscv64-gcc-debug:
+  extends: .gcc-riscv64-cross-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: debian:13-riscv64
+    KBUILD_DEFCONFIG: tiny64_defconfig
+    HYPERVISOR_ONLY: y
+    EXTRA_XEN_CONFIG: |
+      CONFIG_UBSAN=y
+      CONFIG_UBSAN_FATAL=y
+
+# Arm32 cross-build
+
+debian-12-arm32-gcc:
+  extends: .gcc-arm32-cross-build
+  <<: *build-test
+  variables:
+    CONTAINER: debian:12-arm64v8-arm32
+    HYPERVISOR_ONLY: y
+
+debian-12-arm32-gcc-debug:
+  extends: .gcc-arm32-cross-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: debian:12-arm64v8-arm32
+    HYPERVISOR_ONLY: y
+
+debian-12-arm32-gcc-randconfig:
+  extends: .gcc-arm32-cross-build
+  variables:
+    CONTAINER: debian:12-arm64v8-arm32
+    HYPERVISOR_ONLY: y
+    RANDCONFIG: y
+
+debian-12-arm32-gcc-debug-staticmem:
+  extends: .gcc-arm32-cross-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: debian:12-arm64v8-arm32
+    HYPERVISOR_ONLY: y
+    EXTRA_XEN_CONFIG: |
+      CONFIG_EXPERT=y
+      CONFIG_UNSUPPORTED=y
+      CONFIG_STATIC_MEMORY=y
+
+debian-12-arm32-gcc-debug-earlyprintk:
+  extends: .gcc-arm32-cross-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: debian:12-arm64v8-arm32
+    HYPERVISOR_ONLY: y
+    EXTRA_XEN_CONFIG: |
+      CONFIG_EARLY_UART_CHOICE_PL011=y
+      CONFIG_EARLY_UART_BASE_ADDRESS=0x9000000
+
+debian-12-arm32-gcc-debug-mpu:
+  extends: .gcc-arm32-cross-build-debug
+  variables:
+    CONTAINER: debian:12-arm64v8-arm32
+    HYPERVISOR_ONLY: y
+    EXTRA_XEN_CONFIG: |
+      CONFIG_XEN_START_ADDRESS=0x0
+      CONFIG_MPU=y
+      CONFIG_UNSUPPORTED=y
+
+# Arm builds
+
+debian-12-arm64-gcc:
+  extends: .gcc-arm64-build
+  variables:
+    CONTAINER: debian:12-arm64v8
+
+debian-12-arm64-gcc-debug:
+  extends: .gcc-arm64-build-debug
+  variables:
+    CONTAINER: debian:12-arm64v8
+
+debian-13-arm64-gcc:
+  extends: .gcc-arm64-build
+  variables:
+    CONTAINER: debian:13-arm64v8
+
+debian-13-arm64-gcc-debug:
+  extends: .gcc-arm64-build-debug
+  variables:
+    CONTAINER: debian:13-arm64v8
+
+alpine-3.24-arm64-gcc:
+  extends: .gcc-arm64-build
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+
+alpine-3.24-arm64-gcc-debug:
+  extends: .gcc-arm64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+    EXTRA_XEN_CONFIG: |
+      CONFIG_UBSAN=y
+      CONFIG_UBSAN_FATAL=y
+
+alpine-3.24-arm64-gcc-randconfig:
+  extends: .gcc-arm64-build
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+    RANDCONFIG: y
+
+alpine-3.24-arm64-gcc-debug-staticmem:
+  extends: .gcc-arm64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+    EXTRA_XEN_CONFIG: |
+      CONFIG_EXPERT=y
+      CONFIG_UNSUPPORTED=y
+      CONFIG_STATIC_MEMORY=y
+
+alpine-3.24-arm64-gcc-debug-static-shared-mem:
+  extends: .gcc-arm64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+    EXTRA_XEN_CONFIG: |
+      CONFIG_UNSUPPORTED=y
+      CONFIG_STATIC_MEMORY=y
+      CONFIG_STATIC_SHM=y
+
+alpine-3.24-arm64-gcc-debug-boot-cpupools:
+  extends: .gcc-arm64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+    EXTRA_XEN_CONFIG: |
+      CONFIG_BOOT_TIME_CPUPOOLS=y
+
+alpine-3.24-arm64-gcc-debug-earlyprintk:
+  extends: .gcc-arm64-build-debug
+  <<: *build-test
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+    EXTRA_XEN_CONFIG: |
+      CONFIG_EARLY_UART_CHOICE_PL011=y
+      CONFIG_EARLY_UART_BASE_ADDRESS=0x9000000
+
+alpine-3.24-arm64-gcc-debug-mpu:
+  extends: .gcc-arm64-build-debug
+  variables:
+    CONTAINER: alpine:3.24-arm64v8
+    HYPERVISOR_ONLY: y
+    EXTRA_XEN_CONFIG: |
+      CONFIG_XEN_START_ADDRESS=0x0
+      CONFIG_MPU=y
+      CONFIG_UNSUPPORTED=y
+
+# Yocto test jobs
+yocto-qemuarm64:
+  extends: .yocto-test-arm64
+  variables:
+    YOCTO_BOARD: qemuarm64
+
+yocto-qemuarm:
+  extends: .yocto-test-arm64
+  variables:
+    YOCTO_BOARD: qemuarm
+    YOCTO_OUTPUT: --copy-output
+
+yocto-qemux86-64:
+  extends: .yocto-test-x86_64
+  variables:
+    YOCTO_BOARD: qemux86-64
+
+# Cppcheck analysis jobs
+
+debian-12-x86_64-gcc-cppcheck:
+  extends: .gcc-x86_64-cross-build
+  variables:
+    CONTAINER: debian:12-arm64v8-cppcheck
+    CROSS_COMPILE: /usr/bin/x86_64-linux-gnu-
+    CPPCHECK: y
+    HYPERVISOR_ONLY: y
+
+debian-12-arm32-gcc-cppcheck:
+  extends: .gcc-arm32-cross-build
+  variables:
+    CONTAINER: debian:12-arm64v8-cppcheck
+    CROSS_COMPILE: /usr/bin/arm-linux-gnueabihf-
+    CPPCHECK: y
+    HYPERVISOR_ONLY: y
+
+debian-12-arm64-gcc-cppcheck:
+  extends: .gcc-arm64-build
+  variables:
+    CONTAINER: debian:12-arm64v8-cppcheck
+    CPPCHECK: y
+    HYPERVISOR_ONLY: y
+
+# Build jobs not needed for tests
+
+alpine-3.24-x86_64-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: alpine:3.24-x86_64
+
+alpine-3.24-x86_64-clang-debug:
+  extends: .clang-x86_64-build-debug
+  variables:
+    CONTAINER: alpine:3.24-x86_64
+
+archlinux-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: archlinux:current-x86_64
+  allow_failure: true
+
+archlinux-x86_64-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  variables:
+    CONTAINER: archlinux:current-x86_64
+  allow_failure: true
+
+debian-12-x86_64-gcc-ibt:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: debian:12-x86_64-gcc-ibt
+    RANDCONFIG: y
+    EXTRA_FIXED_RANDCONFIG: |
+      CONFIG_XEN_IBT=y
+
+debian-12-x86_64-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: debian:12-x86_64
+
+debian-12-x86_64-clang-debug:
+  extends: .clang-x86_64-build-debug
+  variables:
+    CONTAINER: debian:12-x86_64
+
+debian-12-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: debian:12-x86_64
+
+debian-12-x86_64-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  variables:
+    CONTAINER: debian:12-x86_64
+
+debian-12-x86_32-clang-debug:
+  extends: .clang-x86_32-build-debug
+  variables:
+    CONTAINER: debian:12-x86_32
+
+debian-12-x86_32-gcc-debug:
+  extends: .gcc-x86_32-build-debug
+  variables:
+    CONTAINER: debian:12-x86_32
+
+debian-13-x86_64-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: debian:13-x86_64
+
+debian-13-x86_64-clang-randconfig:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: debian:13-x86_64
+    RANDCONFIG: y
+    EXTRA_FIXED_RANDCONFIG: |
+      CONFIG_COVERAGE=n # Disable coverage otherwise build times out.
+
+debian-13-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: debian:13-x86_64
+
+debian-13-x86_64-gcc-randconfig:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: debian:13-x86_64
+    RANDCONFIG: y
+
+debian-13-x86_32-clang-debug:
+  extends: .clang-x86_32-build-debug
+  variables:
+    CONTAINER: debian:13-x86_32
+
+debian-13-x86_32-gcc-debug:
+  extends: .gcc-x86_32-build-debug
+  variables:
+    CONTAINER: debian:13-x86_32
+
+fedora-43-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: fedora:43-x86_64
+
+fedora-43-x86_64-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  variables:
+    CONTAINER: fedora:43-x86_64
+
+ubuntu-18.04-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: ubuntu:18.04-x86_64
+
+ubuntu-18.04-x86_64-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  variables:
+    CONTAINER: ubuntu:18.04-x86_64
+
+ubuntu-20.04-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: ubuntu:20.04-x86_64
+
+ubuntu-22.04-x86_64-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: ubuntu:22.04-x86_64
+
+ubuntu-22.04-x86_64-clang-debug:
+  extends: .clang-x86_64-build-debug
+  variables:
+    CONTAINER: ubuntu:22.04-x86_64
+
+ubuntu-22.04-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: ubuntu:22.04-x86_64
+
+ubuntu-24.04-x86_64-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: ubuntu:24.04-x86_64
+
+ubuntu-24.04-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: ubuntu:24.04-x86_64
+
+ubuntu-26.04-x86_64-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: ubuntu:26.04-x86_64
+
+ubuntu-26.04-x86_64-clang-debug:
+  extends: .clang-x86_64-build-debug
+  variables:
+    CONTAINER: ubuntu:26.04-x86_64
+
+ubuntu-26.04-x86_64-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: ubuntu:26.04-x86_64
+
+ubuntu-26.04-x86_64-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  variables:
+    CONTAINER: ubuntu:26.04-x86_64
+
+opensuse-leap-16.0-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: opensuse:leap-16.0-x86_64
+
+opensuse-leap-16.0-clang-debug:
+  extends: .clang-x86_64-build-debug
+  variables:
+    CONTAINER: opensuse:leap-16.0-x86_64
+
+opensuse-leap-16.0-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: opensuse:leap-16.0-x86_64
+
+opensuse-leap-16.0-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  variables:
+    CONTAINER: opensuse:leap-16.0-x86_64
+
+opensuse-tumbleweed-clang:
+  extends: .clang-x86_64-build
+  variables:
+    CONTAINER: opensuse:tumbleweed-x86_64
+  allow_failure: true
+
+opensuse-tumbleweed-clang-debug:
+  extends: .clang-x86_64-build-debug
+  variables:
+    CONTAINER: opensuse:tumbleweed-x86_64
+  allow_failure: true
+
+opensuse-tumbleweed-gcc:
+  extends: .gcc-x86_64-build
+  variables:
+    CONTAINER: opensuse:tumbleweed-x86_64
+  allow_failure: true
+
+opensuse-tumbleweed-gcc-debug:
+  extends: .gcc-x86_64-build-debug
+  variables:
+    CONTAINER: opensuse:tumbleweed-x86_64
+  allow_failure: true
+
+# PowerPC builds (x86 cross)
+debian-11-ppc64le-gcc:
+  extends: .gcc-ppc64le-cross-build
+  variables:
+    CONTAINER: debian:11-ppc64le
+    KBUILD_DEFCONFIG: ppc64_defconfig
+    HYPERVISOR_ONLY: y
+
+debian-11-ppc64le-gcc-debug:
+  extends: .gcc-ppc64le-cross-build-debug
+  variables:
+    CONTAINER: debian:11-ppc64le
+    KBUILD_DEFCONFIG: ppc64_defconfig
+    HYPERVISOR_ONLY: y
+
+debian-12-ppc64le-gcc:
+  extends: .gcc-ppc64le-cross-build
+  variables:
+    CONTAINER: debian:12-ppc64le
+    KBUILD_DEFCONFIG: ppc64_defconfig
+    HYPERVISOR_ONLY: y
+
+debian-12-ppc64le-gcc-debug:
+  extends: .gcc-ppc64le-cross-build-debug
+  variables:
+    CONTAINER: debian:12-ppc64le
+    KBUILD_DEFCONFIG: ppc64_defconfig
+    HYPERVISOR_ONLY: y
+
+debian-13-ppc64le-gcc:
+  extends: .gcc-ppc64le-cross-build
+  variables:
+    CONTAINER: debian:13-ppc64le
+    KBUILD_DEFCONFIG: ppc64_defconfig
+    HYPERVISOR_ONLY: y
+
+# RISC-V 64 cross-build
+debian-12-riscv64-gcc:
+  extends: .gcc-riscv64-cross-build
+  variables:
+    CONTAINER: debian:12-riscv64
+    KBUILD_DEFCONFIG: tiny64_defconfig
+    HYPERVISOR_ONLY: y
+
+debian-12-riscv64-gcc-debug:
+  extends: .gcc-riscv64-cross-build-debug
+  variables:
+    CONTAINER: debian:12-riscv64
+    KBUILD_DEFCONFIG: tiny64_defconfig
+    HYPERVISOR_ONLY: y
+
+debian-13-riscv64-gcc:
+  extends: .gcc-riscv64-cross-build
+  variables:
+    CONTAINER: debian:13-riscv64
+    KBUILD_DEFCONFIG: tiny64_defconfig
+    HYPERVISOR_ONLY: y
+
+.riscv-fixed-randconfig:
+  variables: &riscv-fixed-randconfig
+    EXTRA_FIXED_RANDCONFIG: |
+      CONFIG_BOOT_TIME_CPUPOOLS=n
+      CONFIG_COVERAGE=n
+      CONFIG_EXPERT=y
+      CONFIG_GRANT_TABLE=n
+      CONFIG_LIVEPATCH=n
+      CONFIG_QEMU_PLATFORM=y
+      CONFIG_VM_EVENT=n
+      CONFIG_XSM=n
+
+debian-13-riscv64-gcc-randconfig:
+  extends: .gcc-riscv64-cross-build
+  variables:
+    CONTAINER: debian:13-riscv64
+    KBUILD_DEFCONFIG: tiny64_defconfig
+    RANDCONFIG: y
+    <<: *riscv-fixed-randconfig
+
+# macOS build jobs
+.macos-26:
+  <<: *build
+  tags:
+    - saas-macos-medium-m1
+  image: macos-26-xcode-26
+  variables:
+    HOMEBREW_NO_AUTO_UPDATE: 1
+    HOSTCC: clang
+    HYPERVISOR_ONLY: y
+    <<: *gcc
+  script:
+    - brew install ${CROSS_COMPILE}gcc ${CROSS_COMPILE}binutils
+    - alias nproc="sysctl -n hw.ncpu"
+    - ./automation/scripts/build 2>&1 | tee build.log
+
+macos-26-x86_64:
+  extends:
+    - .macos-26
+  variables:
+    XEN_TARGET_ARCH: x86_64
+    CROSS_COMPILE: x86_64-elf-
+
+macos-26-arm64:
+  extends:
+    - .macos-26
+  variables:
+    XEN_TARGET_ARCH: arm64
+    CROSS_COMPILE: aarch64-elf-

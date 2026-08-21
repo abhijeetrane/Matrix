@@ -1,0 +1,102 @@
+package org.eclipse.store.storage.embedded.tools.storage.migrator.typedictionary;
+
+/*-
+ * #%L
+ * EclipseStore Storage Embedded Tools Storage Migrator
+ * %%
+ * Copyright (C) 2023 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import java.nio.file.Paths;
+import java.util.Objects;
+
+import org.openrewrite.ExecutionContext;
+import org.openrewrite.Option;
+import org.openrewrite.Recipe;
+import org.openrewrite.TreeVisitor;
+
+
+/**
+ * OpenRewrite recipe that rewrites a single {@code PersistenceTypeDictionary.ptd} file by applying the
+ * MicroStream-to-EclipseStore package renames declared in {@link org.eclipse.store.storage.embedded.tools.storage.migrator.mappings.PackageMappings}.
+ * <p>
+ * Used as a sub-recipe of {@link org.eclipse.store.storage.embedded.tools.storage.migrator.ConvertProject}
+ * when a relative path to the dictionary file is supplied. The actual rewriting is delegated to a
+ * {@link TypeDictionaryVisitor}.
+ */
+public class UpdateTypeDictionary extends Recipe
+{
+	@Option(
+		displayName = "Type dictionary file path",
+		description = "Absolute path to the type dictionary file.",
+		example = "/home/mystorage/PersistenceTypeDictionary.ptd"
+	)
+	private final String relativeFilePath;
+
+	/**
+	 * Creates a new recipe targeting the dictionary file at the given project-relative path.
+	 *
+	 * @param relativeFilePath the project-relative path of the type dictionary file to rewrite.
+	 */
+	public UpdateTypeDictionary(final String relativeFilePath)
+	{
+		this.relativeFilePath = relativeFilePath;
+	}
+	
+	@Override
+	public String getDisplayName()
+	{
+		return "Update Type Dictionary";
+	}
+	
+	@Override
+	public String getDescription()
+	{
+		return "Updates the type dictionary file.";
+	}
+	
+	public String getRelativeFilePath()
+	{
+		return this.relativeFilePath;
+	}
+	
+	@Override
+	public TreeVisitor<?, ExecutionContext> getVisitor()
+	{
+		return new TypeDictionaryVisitor(Paths.get(this.relativeFilePath));
+	}
+	
+	@Override
+	public boolean equals(final Object o)
+	{
+		if(this == o)
+			return true;
+		if(o == null || this.getClass() != o.getClass())
+			return false;
+		if(!super.equals(o))
+			return false;
+		final UpdateTypeDictionary that = (UpdateTypeDictionary)o;
+		return Objects.equals(this.relativeFilePath, that.relativeFilePath);
+	}
+	
+	@Override
+	public int hashCode()
+	{
+		return Objects.hash(super.hashCode(), this.relativeFilePath);
+	}
+	
+	@Override
+	public String toString()
+	{
+		return "UpdateTypeDictionary{" +
+			"filePath='" + this.relativeFilePath + '\'' +
+			'}';
+	}
+}

@@ -1,0 +1,348 @@
+= Properties
+
+These are the available properties of the `EmbeddedStorageConfigurationBuilder` type.
+The names are used accordingly in the external configuration files.
+They can be found as constants in `EmbeddedStorageConfigurationPropertyNames`.
+
+[options="header",cols="2,4,1"]
+|===
+|Property
+|Short Description
+|Type
+
+|storage-directory
+|The base directory of the storage in the file system. Default is `"storage"` in the working directory.
+|xref:#type-string[String]
+
+|storage-filesystem
+|The live file system configuration. See xref:storage-targets/index.adoc[storage targets] configuration.
+|xref:#type-complex[Complex]
+
+|deletion-directory
+|If configured, the storage will not delete files. Instead of deleting a file it will be moved to this directory.
+|xref:#type-string[String]
+
+|truncation-directory
+|If configured, files that will get truncated are copied into this directory.
+|xref:#type-string[String]
+
+|backup-directory
+|The backup directory.
+|xref:#type-string[String]
+
+|backup-filesystem
+|The backup file system configuration. See xref:storage-targets/index.adoc[storage targets] configuration.
+|xref:#type-complex[Complex]
+
+|xref:#channel-count[channel-count]
+|The number of threads and number of directories used by the storage engine. Every thread has exclusive access to its directory. Default is `1`.
+|xref:#type-integer[Integer]
+
+|channel-directory-prefix
+|Name prefix of the subdirectories used by the channel threads. Default is `"channel_"`.
+|xref:#type-string[String]
+
+|data-file-prefix
+|Name prefix of the storage files. Default is `"channel_"`.
+|xref:#type-string[String]
+
+|data-file-suffix
+|Name suffix of the storage files. Default is `"dat"`.
+|xref:#type-string[String]
+
+|transaction-file-prefix
+|Name prefix of the storage transaction file. Default is `"transactions_"`.
+|xref:#type-string[String]
+
+|transaction-file-suffix
+|Name suffix of the storage transaction file. Default is `"sft"`.
+|xref:#type-string[String]
+
+|type-dictionary-file-name
+|The name of the dictionary file. Default is `"PersistenceTypeDictionary.ptd"`.
+|xref:#type-string[String]
+
+|rescued-file-suffix
+|Name suffix of the storage rescue files. Default is `"bak"`.
+|xref:#type-string[String]
+
+|lock-file-name
+|Name of the lock file. Default is `"used.lock"`.
+|xref:#type-string[String]
+
+|xref:#housekeeping-interval[housekeeping-interval]
+|Interval for the housekeeping. This is work like garbage collection or cache checking. In combination with houseKeepingNanoTimeBudget the maximum processor time for housekeeping work can be set. Default is 1 second.
+|xref:#type-duration[Duration]
+
+|xref:#housekeeping-time-budget[housekeeping-time-budget]
+|Number of nanoseconds used for each housekeeping cycle. Default is 10 milliseconds = 0.01 seconds.
+|xref:#type-duration[Duration]
+
+|housekeeping-adaptive
+|Usage of an adaptive housekeeping controller, which will increase the time budgets on demand, if the garbage collector needs more time to reach the sweeping phase.
+|xref:#type-boolean[Boolean]
+
+|housekeeping-increase-threshold
+|The threshold of the adaption cycle to calculate new budgets for the housekeeping process. Default is 5 seconds.
+|xref:#type-duration[Duration]
+
+|housekeeping-increase-amount
+|The amount the housekeeping budgets will be increased each cycle. Default is 50 ms.
+|xref:#type-duration[Duration]
+
+|housekeeping-maximum-time-budget
+|The upper limit of the housekeeping time budgets. Default is 0.5 seconds.
+|xref:#type-duration[Duration]
+
+|gc-sweep-threshold
+|Number of consecutive garbage-collection sweeps an entity must remain unmarked before it is deleted (a safety net against rare, transient GC concurrency races). Valid range is 1 to 127, default is 3.
+|xref:#type-integer[Integer]
+
+|entity-cache-threshold
+|Abstract threshold value for the lifetime of entities in the cache. Default is `1000000000`.
+|xref:#type-long[Long]
+
+|entity-cache-timeout
+|Timeout in milliseconds for the entity cache evaluator. If an entity wasn't accessed in this timespan it will be removed from the cache. Default is 1 day.
+|xref:#type-duration[Duration]
+
+|xref:#data-file-minimum-size[data-file-minimum-size]
+|Minimum file size for a data file to avoid cleaning it up. Default is 1024^2 = 1 MiB.
+|xref:#type-bytes[Bytes]
+
+|xref:#data-file-maximum-size[data-file-maximum-size]
+|Maximum file size for a data file to avoid cleaning it up. Default is 1024^2*8 = 8 MiB.
+|xref:#type-bytes[Bytes]
+
+|xref:#data-file-minimum-use-ratio[data-file-minimum-use-ratio]
+|The ratio (value in ]0.0;1.0]) of non-gap data contained in a storage file to prevent the file from being dissolved. Default is `0.75` (75%).
+|xref:#type-double[Double]
+
+|data-file-cleanup-head-file
+|A flag defining whether the current head file (the only file actively written to) shall be subjected to file cleanups as well.
+|xref:#type-boolean[Boolean]
+
+|xref:#transaction-file-maximum-size[transaction-file-maximum-size]
+|Maximum file size for each channels transactions log file. If this limit is exceeded the file wile be cleaned up during housekeeping. Default is 100 MiB. Maximum value is 1 GiB.
+|xref:#type-bytes[Bytes]
+
+|reference-validation
+|Store-time validation of references whose target entities are not part of the store itself (`off`, `log`, `fail` or `heal`). With `log` (the default), a store referencing a non-existing entity (dangling reference) is logged as an error but proceeds; with `fail` such a store is rejected atomically; with `heal` a rejected store is additionally repaired automatically (the still-live referenced instances are re-stored under their existing object ids and the store is retried); `off` disables the validation entirely (zero overhead). See xref:../data-integrity.adoc[Data Integrity] for the failure mode this guards against.
+|xref:#type-string[String]
+
+|gc-zombie-oid-handling
+|Reaction of the storage garbage collector to an encountered zombie object id — a persisted binary record referencing a non-existing entity, i.e. a dangling reference already present in the storage (`log` or `fail`). With `log` (the default), the zombie is logged as a warning and reported to the event logger, and garbage collection continues; with `fail` a `StorageExceptionConsistencyZombieOid` is thrown, halting the affected channel while the evidence may still be recoverable. See xref:../data-integrity.adoc[Data Integrity].
+|xref:#type-string[String]
+|===
+
+== Property Types
+
+[#type-complex]
+=== Complex
+Parent property with multiple possible children.
+
+[#type-string]
+=== String
+Simple string literal.
+
+Special case for directories: Prefix `~` can be used for user home, e.g. `~/my-app/storage`
+
+[#type-integer]
+=== Integer
+Signed integer, same as Java's `int`.
+
+[#type-long]
+=== Long
+Signed long, same as Java's `long`.
+
+[#type-double]
+=== Double
+Signed double, same as Java's `double`.
+
+[#type-boolean]
+=== Boolean
+`true` or `false`
+
+[#type-duration]
+=== Duration
+Time interval, either in ISO format `PnDTnHnMn.nS`, or simple amount and unit `amount[ns|ms|s|m|h|d]`, e.g. `30 M`
+
+More details in https://github.com/eclipse-serializer/serializer/blob/main/configuration/configuration/src/main/java/org/eclipse/serializer/configuration/types/DurationParser.java[DurationParser].
+
+[#type-bytes]
+=== Bytes
+Amount of bytes: `amount[b|kb|kib|mb|mib|gb|big|tb|tib|pb|pib]`, e.g. `1.5 GB`
+
+More details in https://github.com/eclipse-serializer/serializer/blob/main/configuration/configuration/src/main/java/org/eclipse/serializer/configuration/types/ByteSizeParser.java[ByteSizeParser] and https://github.com/eclipse-serializer/serializer/blob/main/configuration/configuration/src/main/java/org/eclipse/serializer/configuration/types/ByteUnit.java[ByteUnit].
+
+
+== Detailed Description
+
+[#channel-count]
+=== channel-count
+
+Number of threads used by the storage engine.
+It depicts the numbers of subdirectories as well.
+Each thread manages one directory in which it writes to and reads from exclusively.
+The unity of thread, directory and the cached data therefore is called a "Channel".
+
+[source,text]
+----
+__________________________________________________
+                               [RAM ]{ Code }    |    (      Filesystem      )
+               ,- "Channel 0": [Data]{Thread} <-I|O-> (Storage Subdirectory 0)
+              /-- "Channel 1": [Data]{Thread} <-I|O-> (Storage Subdirectory 1)
+StorageManager                                   |
+              \-- "Channel 2": [Data]{Thread} <-I|O-> (Storage Subdirectory 2)
+               '- "Channel 3": [Data]{Thread} <-I|O-> (Storage Subdirectory 3)
+_________________________________________________|
+----
+
+For further information see xref:configuration/using-channels.adoc[Using Channels].
+
+[#housekeeping-interval]
+=== housekeeping-interval
+
+Time for the house keeping interval.
+House keeping tasks are, among others:
+
+* Garbage Collection
+* Cache Check
+* File Cleanup Check
+
+In combination with housekeeping-time-budget, it can be specified how many CPU time should be used for house keeping.
+E.g.
+interval=1000ms and budget=10000000ns means every second there's 0.01 seconds time for house keeping, so max 1% CPU time used for house keeping.
+This CPU time window is only used if house keeping work is pending.
+If nothing has to be done, no time is wasted.
+
+[#housekeeping-time-budget]
+=== housekeeping-time-budget
+
+Time used for each housekeeping cycle.
+However, no matter how low the number is, one item of work will always be completed.
+But if there is nothing to clean up, no processor time will be wasted.
+Default is `10000000` (10 million nanoseconds = 10 milliseconds = 0.01 seconds).
+However, no matter how small the time is, one item is done at least.
+This is to avoid no-ops, if a too small time window is configured.
+This time budget is a "best effort" threshold, meaning when at 1ns left, a huge file has to be cleaned or the references of a huge collection have to be marked for GC, then this budget can be exceeded considerably.
+
+For further information see xref:configuration/housekeeping.adoc[Housekeeping].
+
+[#data-file-minimum-size]
+=== data-file-minimum-size
+
+Minimum file size in bytes of a storage file to avoid merging with other files during housekeeping.
+Must be greater than 1, maximum is 2GB.
+
+[#data-file-maximum-size]
+=== data-file-maximum-size
+
+Maximum file size in bytes of a storage file to avoid splitting in more files during housekeeping.
+Must be greater than 1, maximum is 2GB.
+
+TIP: Due to internal implementation details files larger than 2GB are not supported!
+
+[#data-file-minimum-use-ratio]
+=== data-file-minimum-use-ratio
+
+The ratio (value in ]0.0;1.0]) of non-gap data contained in a storage file to prevent the file from being dissolved.
+"Gap" data is anything that is not the latest version of an entity's data, including older versions of an entity and "comment" bytes (a sequence of bytes beginning with its length as a negative value length header).
+The closer this value is to 1.0 (100%), the less disk space is occupied by storage files, but the more file dissolving (data transfers to new files) is required and vice versa.
+
+[#transaction-file-maximum-size]
+=== transaction-file-maximum-size
+Maximum file size for each channels transactions log file. If this limit is exceeded the file wile be cleaned up during housekeeping.
+
+To shrink the file size all store, transfer, and truncation entries are combined into one single store entry
+for each storage files. FileCreation entries are kept, FileDeletion entries are kept
+if the storage data file still exists on the file system. Otherwise all entries related
+to deleted files are removed if the storage data file does no more exist.
+
+Default is 100 MB.
+Maximum value is 1 GB.
+
+== Involved Types
+
+This list shows which property configures which type, used by the foundation types, to create the storage manager.
+
+[options="header",cols="1,2"]
+|===
+| Property
+| Used by
+
+| storage-directory
+| `StorageLiveFileProvider`
+
+| storage-filesystem
+| `StorageLiveFileProvider`
+
+| deletion-directory
+| `StorageLiveFileProvider`
+
+| truncation-directory
+| `StorageLiveFileProvider`
+
+| backup-directory
+| `StorageBackupSetup`
+
+| backup-filesystem
+| `StorageBackupSetup`
+
+| channel-count
+| `StorageChannelCountProvider`
+
+| channel-directory-prefix
+| `StorageFileNameProvider`
+
+| data-file-prefix
+| `StorageFileNameProvider`
+
+| data-file-suffix
+| `StorageFileNameProvider`
+
+| transaction-file-prefix
+| `StorageFileNameProvider`
+
+| transaction-file-suffix
+| `StorageFileNameProvider`
+
+| type-dictionary-filename
+| `StorageFileNameProvider`
+
+| rescued-file-suffix
+| `StorageFileNameProvider`
+
+| lock-filename
+| `StorageFileNameProvider`
+
+| housekeeping-interval
+| `StorageHousekeepingController`
+
+| housekeeping-time-budget
+| `StorageHousekeepingController`
+
+| entity-cache-threshold
+| `StorageEntityCacheEvaluator`
+
+| entity-cache-timeout
+| `StorageEntityCacheEvaluator`
+
+| data-file-minimum-size
+| `StorageDataFileEvaluator`
+
+| data-file-maximum-size
+| `StorageDataFileEvaluator`
+
+| data-file-minimum-use-ratio
+| `StorageDataFileEvaluator`
+
+| data-file-cleanup-head-file
+| `StorageDataFileEvaluator`
+
+| transaction-file-maximum-size
+| `StorageDataFileEvaluator`
+
+| reference-validation
+| `StorageReferenceValidationPolicy`
+|===

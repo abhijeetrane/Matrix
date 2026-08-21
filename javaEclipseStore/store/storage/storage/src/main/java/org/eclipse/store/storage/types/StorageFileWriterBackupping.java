@@ -1,0 +1,361 @@
+package org.eclipse.store.storage.types;
+
+/*-
+ * #%L
+ * EclipseStore Storage
+ * %%
+ * Copyright (C) 2023 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import static org.eclipse.serializer.util.X.notNull;
+
+import java.nio.ByteBuffer;
+
+
+public interface StorageFileWriterBackupping extends StorageFileWriter
+{
+	public final class Default implements StorageFileWriter
+	{
+		///////////////////////////////////////////////////////////////////////////
+		// instance fields //
+		////////////////////
+
+		private final StorageFileWriter         delegate    ;
+		private final StorageBackupItemEnqueuer itemEnqueuer;
+		
+		
+		
+		///////////////////////////////////////////////////////////////////////////
+		// constructors //
+		/////////////////
+		
+		Default(
+			final StorageFileWriter         delegate    ,
+			final StorageBackupItemEnqueuer itemEnqueuer
+		)
+		{
+			super();
+			this.delegate     = delegate    ;
+			this.itemEnqueuer = itemEnqueuer;
+		}
+
+
+		
+		///////////////////////////////////////////////////////////////////////////
+		// methods //
+		////////////
+			
+		/**
+		 * Sum of remaining bytes across the buffers, computed before the write consumes them.
+		 */
+		private static long totalRemaining(final Iterable<? extends ByteBuffer> byteBuffers)
+		{
+			long total = 0L;
+			for(final ByteBuffer byteBuffer : byteBuffers)
+			{
+				total += byteBuffer.remaining();
+			}
+			return total;
+		}
+
+		@Override
+		public final long writeStore(
+			final StorageLiveDataFile            targetFile ,
+			final Iterable<? extends ByteBuffer> byteBuffers
+		)
+		{
+			final long oldTargetFileLength = targetFile.size();
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				totalRemaining(byteBuffers),
+				this.delegate.writeStore(targetFile, byteBuffers)
+			);
+
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(targetFile, oldTargetFileLength, byteCount);
+
+			return byteCount;
+		}
+		
+		@Override
+		public final long writeImport(
+			final StorageImportSource source      ,
+			final long                sourceOffset,
+			final long                copyLength  ,
+			final StorageLiveDataFile targetFile
+		)
+		{
+			final long oldTargetFileLength = targetFile.size();
+
+			// validate before enqueueing: no backup item for a short copy.
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				copyLength,
+				this.delegate.writeImport(source, sourceOffset, copyLength, targetFile)
+			);
+
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(targetFile, oldTargetFileLength, byteCount);
+
+			return byteCount;
+		}
+		
+		@Override
+		public final long writeTransfer(
+			final StorageLiveDataFile sourceFile  ,
+			final long                sourceOffset,
+			final long                length      ,
+			final StorageLiveDataFile targetFile
+		)
+		{
+			final long oldTargetFileLength = targetFile.size();
+
+			// validate before enqueueing: no backup item for a short copy.
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				length,
+				this.delegate.writeTransfer(sourceFile, sourceOffset, length, targetFile)
+			);
+
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(targetFile, oldTargetFileLength, byteCount);
+
+			return byteCount;
+		}
+		
+		@Override
+		public final long writeTransactionEntryCreate(
+			final StorageLiveTransactionsFile    transactionFile,
+			final Iterable<? extends ByteBuffer> byteBuffers    ,
+			final StorageLiveDataFile            dataFile
+		)
+		{
+			final long oldLength = transactionFile.size();
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				totalRemaining(byteBuffers),
+				this.delegate.writeTransactionEntryCreate(
+					transactionFile,
+					byteBuffers    ,
+					dataFile
+				)
+			);
+			
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(transactionFile, oldLength, byteCount);
+			
+			return byteCount;
+		}
+		
+		@Override
+		public final long writeTransactionEntryStore(
+			final StorageLiveTransactionsFile    transactionFile,
+			final Iterable<? extends ByteBuffer> byteBuffers    ,
+			final StorageLiveDataFile            dataFile       ,
+			final long                           dataFileOffset ,
+			final long                           storeLength
+		)
+		{
+			final long oldLength = transactionFile.size();
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				totalRemaining(byteBuffers),
+				this.delegate.writeTransactionEntryStore(
+					transactionFile,
+					byteBuffers    ,
+					dataFile       ,
+					dataFileOffset ,
+					storeLength
+				)
+			);
+			
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(transactionFile, oldLength, byteCount);
+			
+			return byteCount;
+		}
+		
+		@Override
+		public final long writeTransactionEntryTransfer(
+			final StorageLiveTransactionsFile    transactionFile,
+			final Iterable<? extends ByteBuffer> byteBuffers    ,
+			final StorageLiveDataFile            dataFile       ,
+			final long                           dataFileOffset ,
+			final long                           storeLength
+		)
+		{
+			final long oldLength = transactionFile.size();
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				totalRemaining(byteBuffers),
+				this.delegate.writeTransactionEntryTransfer(
+					transactionFile,
+					byteBuffers    ,
+					dataFile       ,
+					dataFileOffset ,
+					storeLength
+				)
+			);
+			
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(transactionFile, oldLength, byteCount);
+			
+			return byteCount;
+		}
+		
+		@Override
+		public final long writeTransactionEntryDelete(
+			final StorageLiveTransactionsFile    transactionFile,
+			final Iterable<? extends ByteBuffer> byteBuffers    ,
+			final StorageLiveDataFile            dataFile
+		)
+		{
+			final long oldLength = transactionFile.size();
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				totalRemaining(byteBuffers),
+				this.delegate.writeTransactionEntryDelete(
+					transactionFile,
+					byteBuffers    ,
+					dataFile
+				)
+			);
+			
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(transactionFile, oldLength, byteCount);
+			
+			return byteCount;
+		}
+		
+		@Override
+		public final long writeTransactionEntryTruncate(
+			final StorageLiveTransactionsFile    transactionFile,
+			final Iterable<? extends ByteBuffer> byteBuffers    ,
+			final StorageLiveDataFile            file           ,
+			final long                           newFileLength
+		)
+		{
+			final long oldLength = transactionFile.size();
+			final long byteCount = StorageFileWriter.validateIoByteCount(
+				totalRemaining(byteBuffers),
+				this.delegate.writeTransactionEntryTruncate(
+					transactionFile,
+					byteBuffers    ,
+					file           ,
+					newFileLength
+				)
+			);
+			
+			// backup item is enqueued and will be processed by the backup thread, which then decrements the user count.
+			this.itemEnqueuer.enqueueCopyingItem(transactionFile, oldLength, byteCount);
+			
+			return byteCount;
+		}
+
+		@Override
+		public final void truncate(
+			final StorageLiveChannelFile<?> file        ,
+			final long                      newLength   ,
+			final StorageFileProvider       fileProvider
+		)
+		{
+			// Both queue mutations must run BEFORE the physical truncate: the trim drops queued copy
+			// items for the removed range, and the truncating item must already be queued when an
+			// in-flight copy (invisible to the trim) fails on the shortened source, so its absorption
+			// check finds it. Enqueuing afterwards leaves a race that escalates a handled rollback.
+			this.itemEnqueuer.trimPendingCopyItemsBeyond(file, newLength);
+			this.itemEnqueuer.enqueueTruncatingItem(file, newLength);
+
+			// no user increment since only the identifier is required and the actual file can well be deleted.
+			this.delegate.truncate(file, newLength, fileProvider);
+		}
+		
+		@Override
+		public void delete(
+			final StorageLiveDataFile    file           ,
+			final StorageWriteController writeController,
+			final StorageFileProvider    fileProvider
+		)
+		{
+			// Both queue mutations must run BEFORE the physical delete: cancel drops still-queued
+			// items for the file, and the deletion item must already be queued when an in-flight
+			// copy fails on the vanished source, so its absorption check finds it. Enqueuing
+			// afterwards leaves a race that escalates an intended deletion.
+			this.itemEnqueuer.cancelPendingItemsFor(file);
+			this.itemEnqueuer.enqueueDeletionItem(file);
+
+			// no user increment since only the identifier is required and the actual file can well be deleted.
+			this.delegate.delete(file, writeController, fileProvider);
+		}
+		
+	}
+	
+	public static StorageFileWriterBackupping.Provider Provider(
+		final StorageBackupItemEnqueuer  backupItemEnqueuer,
+		final StorageFileWriter.Provider wrappedProvider
+	)
+	{
+		return new StorageFileWriterBackupping.Provider.Default(
+			notNull(backupItemEnqueuer),
+			notNull(wrappedProvider)
+		);
+	}
+
+	public interface Provider extends StorageFileWriter.Provider
+	{
+		
+		public static final class Default implements StorageFileWriterBackupping.Provider
+		{
+			///////////////////////////////////////////////////////////////////////////
+			// instance fields //
+			////////////////////
+			
+			final StorageBackupItemEnqueuer  backupItemEnqueuer;
+			final StorageFileWriter.Provider wrappedProvider   ;
+					
+			
+			
+			///////////////////////////////////////////////////////////////////////////
+			// constructors //
+			/////////////////
+
+			Default(
+				final StorageBackupItemEnqueuer  backupItemEnqueuer,
+				final StorageFileWriter.Provider wrappedProvider
+			)
+			{
+				super();
+				this.backupItemEnqueuer = backupItemEnqueuer;
+				this.wrappedProvider    = wrappedProvider   ;
+			}
+			
+			
+			
+			///////////////////////////////////////////////////////////////////////////
+			// methods //
+			////////////
+
+			@Override
+			public StorageFileWriter provideWriter(final int channelIndex)
+			{
+				final StorageFileWriter delegateWriter = this.wrappedProvider.provideWriter(channelIndex);
+				
+				return new StorageFileWriterBackupping.Default(
+					delegateWriter,
+					this.backupItemEnqueuer
+				);
+			}
+			
+			@Override
+			public StorageFileWriter provideWriter()
+			{
+				// non-channel-file writing (e.g. lock file) is not part of the backupping (yet), so just pass through.
+				return this.wrappedProvider.provideWriter();
+			}
+
+		}
+	}
+	
+	
+	
+}

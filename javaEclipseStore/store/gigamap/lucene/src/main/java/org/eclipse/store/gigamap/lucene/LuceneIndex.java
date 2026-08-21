@@ -1,0 +1,1327 @@
+package org.eclipse.store.gigamap.lucene;
+
+/*-
+ * #%L
+ * EclipseStore GigaMap Lucene
+ * %%
+ * Copyright (C) 2023 - 2026 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field.Store;
+import org.apache.lucene.document.LongField;
+import org.apache.lucene.index.*;
+import org.apache.lucene.queryparser.flexible.core.QueryNodeException;
+import org.apache.lucene.queryparser.flexible.standard.StandardQueryParser;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.store.*;
+import org.apache.lucene.util.IOUtils;
+import org.eclipse.serializer.collections.BulkList;
+import org.eclipse.serializer.exceptions.IORuntimeException;
+import org.eclipse.serializer.math.XMath;
+import org.eclipse.serializer.persistence.binary.types.BinaryTypeHandler;
+import org.eclipse.serializer.persistence.types.Storer;
+import org.eclipse.serializer.util.X;
+import org.eclipse.store.gigamap.types.*;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.NoSuchFileException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.CRC32;
+
+import static org.eclipse.serializer.util.X.notNull;
+
+
+/**
+ * Represents a Lucene-based index for managing and querying entities of type E.
+ * This interface extends both the {@link IndexGroup} interface and the {@link Closeable} interface,
+ * providing methods for querying entities using Lucene queries and text search, as well as lifecycle
+ * management methods for closing the index.
+ *
+ * @param <E> The type of entity managed by the index.
+ */
+public interface LuceneIndex<E> extends IndexGroup<E>, Closeable
+{
+	/**
+	 * A functional interface for consuming search results retrieved from a Lucene index.
+	 * <p>
+	 * The {@code SearchResultAcceptor} interface provides a method for accepting individual
+	 * search results from a query execution. It is used to process the ID, entity,
+	 * and associated relevance score of each search result.
+	 *
+	 * @param <E> the type of the entity associated with the search result
+	 */
+	public interface SearchResultAcceptor<E>
+	{
+		public void accept(long entityId, E entity, float score);
+	}
+	
+	/**
+	 * Executes a query against the Lucene index and processes the results using the provided
+	 * {@code SearchResultAcceptor}. This method allows defining custom logic for handling each
+	 * search result, including its entity ID, associated entity, and relevance score.
+	 *
+	 * @param <A> the type of the {@code SearchResultAcceptor} that will process the search results
+	 * @param query the {@code Query} object representing the search criteria to be executed
+	 * @param searchResultAcceptor an instance of {@code SearchResultAcceptor} to handle each search result
+	 *                             returned by the query execution
+	 * @return the {@code SearchResultAcceptor} instance provided as a parameter, potentially modified
+	 *         during the result handling process
+	 */
+	public <A extends SearchResultAcceptor<? super E>> A query(Query query, A searchResultAcceptor);
+	
+	/**
+	 * Executes a query against the Lucene index and processes the results using the provided
+	 * {@code SearchResultAcceptor}. This method allows defining custom logic for handling each
+	 * search result, including its entity ID, associated entity, and relevance score, with a limit
+	 * on the maximum number of results.
+	 *
+	 * @param <A> the type of the {@code SearchResultAcceptor} that will process the search results
+	 * @param query the {@code Query} object representing the search criteria to be executed
+	 * @param maxResults the maximum number of search results that should be processed;
+	 *                   a non-positive value processes no results at all
+	 * @param searchResultAcceptor an instance of {@code SearchResultAcceptor} to handle each search result
+	 *                             returned by the query execution
+	 * @return the {@code SearchResultAcceptor} instance provided as a parameter, potentially modified
+	 *         during the result handling process
+	 */
+	public <A extends SearchResultAcceptor<? super E>> A query(Query query, int maxResults, A searchResultAcceptor);
+	
+	/**
+	 * Executes a query against the Lucene index using the specified query text and processes the results
+	 * using the provided {@code SearchResultAcceptor}. This method allows defining custom logic for
+	 * handling each search result, including its entity ID, associated entity, and relevance score.
+	 *
+	 * @param <A> the type of the {@code SearchResultAcceptor} that will process the search results
+	 * @param queryText the text representation of the query to be executed
+	 * @param searchResultAcceptor an instance of {@code SearchResultAcceptor} to handle each search result
+	 *                              returned by the query execution
+	 * @return the {@code SearchResultAcceptor} instance provided as a parameter, potentially modified
+	 *         during the result handling process
+	 */
+	public <A extends SearchResultAcceptor<? super E>> A query(String queryText, A searchResultAcceptor);
+	
+	/**
+	 * Executes a query against the Lucene index using the specified query text and processes
+	 * the results using the provided {@code SearchResultAcceptor}. This method allows defining
+	 * custom logic for handling each search result, including its entity ID, associated entity,
+	 * and relevance score, with a limit on the maximum number of results.
+	 *
+	 * @param <A> the type of the {@code SearchResultAcceptor} that will process the search results
+	 * @param queryText the text representation of the query to be executed
+	 * @param maxResults the maximum number of search results that should be processed;
+	 *                   a non-positive value processes no results at all
+	 * @param searchResultAcceptor an instance of {@code SearchResultAcceptor} to handle each search result
+	 *                              returned by the query execution
+	 * @return the {@code SearchResultAcceptor} instance provided as a parameter, potentially modified
+	 *         during the result handling process
+	 */
+	public <A extends SearchResultAcceptor<? super E>> A query(String queryText, int maxResults, A searchResultAcceptor);
+	
+	/**
+	 * Executes a query against the Lucene index and returns a list of entities
+	 * that match the provided search criteria. Uses the current {@link GigaMap} size as the
+	 * default result limit, so an empty {@link GigaMap} yields an empty list.
+	 *
+	 * @param query the {@code Query} object representing the search criteria to be executed
+	 * @return a {@code List} of entities of type {@code E} that match the query
+	 */
+	public default List<E> query(final Query query)
+	{
+		final List<E> result = new ArrayList<>();
+		this.query(query, (entityId, entity, score) -> result.add(entity));
+		return result;
+	}
+	
+	/**
+	 * Executes a query against the Lucene index and returns a list of entities
+	 * that match the provided search criteria, with a limit on the maximum number of results.
+	 *
+	 * @param query the {@code Query} object representing the search criteria to be executed
+	 * @param maxResults the maximum number of search results to be returned;
+	 *                   a non-positive value returns no results at all
+	 * @return a {@code List} of entities of type {@code E} that match the query
+	 */
+	public default List<E> query(final Query query, final int maxResults)
+	{
+		final List<E> result = new ArrayList<>();
+		this.query(query, maxResults, (entityId, entity, score) -> result.add(entity));
+		return result;
+	}
+	
+	/**
+	 * Executes a query against the Lucene index using the specified query text
+	 * and returns a list of entities that match the query. Uses the current {@link GigaMap} size
+	 * as the default result limit, so an empty {@link GigaMap} yields an empty list.
+	 *
+	 * @param queryText the text representation of the query to be executed
+	 * @return a list of entities of type {@code E} that match the query
+	 */
+	public default List<E> query(final String queryText)
+	{
+		final List<E> result = new ArrayList<>();
+		this.query(queryText, (entityId, entity, score) -> result.add(entity));
+		return result;
+	}
+	
+	/**
+	 * Executes a query against the Lucene index using the specified query text and returns
+	 * a list of entities matching the query, with a limit on the maximum number of results.
+	 *
+	 * @param queryText the text representation of the query to be executed
+	 * @param maxResults the maximum number of search results to be returned;
+	 *                   a non-positive value returns no results at all
+	 * @return a list of entities of type {@code E} that match the query
+	 */
+	public default List<E> query(final String queryText, final int maxResults)
+	{
+		final List<E> result = new ArrayList<>();
+		this.query(queryText, maxResults, (entityId, entity, score) -> result.add(entity));
+		return result;
+	}
+
+	/**
+	 * Executes a query against the Lucene index and returns a {@link LuceneSearchResult}
+	 * carrying the matching entity ids, entities and relevance scores.
+	 * <p>
+	 * The returned result is also a {@link GigaMap.SubQuery} and can therefore be combined
+	 * with other {@link GigaQuery} conditions via {@link GigaQuery#and(GigaMap.SubQuery)}.
+	 *
+	 * @param query the {@link Query} representing the search criteria
+	 * @param maxResults the maximum number of search results to be returned;
+	 *                   a non-positive value returns no results at all
+	 * @return a {@link LuceneSearchResult} with the matching entries
+	 */
+	public LuceneSearchResult<E> search(Query query, int maxResults);
+
+	/**
+	 * Executes a query against the Lucene index and returns a {@link LuceneSearchResult}
+	 * carrying the matching entity ids, entities and relevance scores.
+	 * <p>
+	 * The returned result is also a {@link GigaMap.SubQuery} and can therefore be combined
+	 * with other {@link GigaQuery} conditions via {@link GigaQuery#and(GigaMap.SubQuery)}.
+	 *
+	 * @param queryText the text representation of the query to be executed
+	 * @param maxResults the maximum number of search results to be returned;
+	 *                   a non-positive value returns no results at all
+	 * @return a {@link LuceneSearchResult} with the matching entries
+	 */
+	public LuceneSearchResult<E> search(String queryText, int maxResults);
+
+	/**
+	 * Executes a query against the Lucene index and returns a {@link LuceneSearchResult}
+	 * carrying the matching entity ids, entities and relevance scores. Uses the current
+	 * {@link GigaMap} size as the default result limit.
+	 *
+	 * @param query the {@link Query} representing the search criteria
+	 * @return a {@link LuceneSearchResult} with the matching entries
+	 */
+	public LuceneSearchResult<E> search(Query query);
+
+	/**
+	 * Executes a query against the Lucene index using the specified query text and returns
+	 * a {@link LuceneSearchResult} carrying the matching entity ids, entities and relevance
+	 * scores. Uses the current {@link GigaMap} size as the default result limit.
+	 *
+	 * @param queryText the text representation of the query to be executed
+	 * @return a {@link LuceneSearchResult} with the matching entries
+	 */
+	public LuceneSearchResult<E> search(String queryText);
+
+    /**
+     * Commits any pending changes to the Lucene index, ensuring that all modifications
+     * are written and made visible to subsequent search operations. This operation
+     * finalizes recent additions, updates, or deletions of indexed entities.
+     * <p>
+     * Note: If {@link LuceneContext#autoCommit()} returns {@code true}, which is the default,
+     * this method doesn't need to be invoked explicitly. When {@code autoCommit()} is
+     * {@code false}, pending changes are also committed automatically at each
+     * {@code GigaMap.store()} boundary, so an explicit call is only needed to commit between
+     * stores.
+     */
+    public void commit();
+	
+	/**
+	 * Closes this index and all resources associated with it.
+	 * <p>
+	 * Note that this index can be re-used after it was closed.
+	 * Internally, it uses lazy initialization, which will be triggered again after it was closed.
+	 */
+	@Override
+	public void close();
+	
+	
+	public interface Internal<E> extends LuceneIndex<E>, IndexGroup.Internal<E>
+	{
+		// typing interface
+	}
+	
+	
+	public class Default<E> extends AbstractStateChangeFlagged implements Internal<E>
+	{
+		static BinaryTypeHandler<LuceneIndex.Default<?>> provideTypeHandler()
+		{
+			return BinaryHandlerLuceneIndexDefault.New();
+		}
+
+
+		private final static String ENTITY_ID_FIELD = "_id_";
+		
+		private static Query queryFor(final long entityId)
+		{
+			return LongField.newExactQuery(ENTITY_ID_FIELD, entityId);
+		}
+		
+		///////////////////////////////////////////////////////////////////////////
+		// instance fields //
+		////////////////////
+		
+		final GigaMap<E>          gigaMap;
+		final LuceneContext<E>    context;
+
+		/**
+		 * Optional registry for storage directory files, if the index data should be persisted directly inside the graph.
+		 * Used by {@link GraphDirectory}, which will be created automatically, if no {@link DirectoryCreator} is provided,
+		 * by the {@link LuceneContext}.
+		 */
+		ConcurrentHashMap<String, FileEntry> fileEntries;
+
+		private transient Analyzer      analyzer;
+		private transient Directory     directory;
+		private transient IndexWriter   writer;
+		private transient IndexSearcher searcher;
+
+		/**
+		 * The near-real-time reader, opened from {@link #writer} and (re)opened exclusively by
+		 * {@link #refreshReaderIfNeeded()}.
+		 * <p>
+		 * Package-private rather than private so that {@code LuceneWritePathReaderTest} can assert that the
+		 * write path never (re)opens it, matching the visibility already used for {@link #gigaMap},
+		 * {@link #context} and {@link #fileEntries}.
+		 */
+		transient DirectoryReader reader;
+
+		/**
+		 * {@code true} when {@link #writer} mutations happened that {@link #reader} does not reflect yet.
+		 * Write operations only set this flag instead of reopening the near-real-time reader; the reopen is
+		 * deferred to the next search (see {@link #refreshReaderIfNeeded()}).
+		 * <p>
+		 * Deliberately not {@code volatile}: like all other transient Lucene state of this class it is
+		 * exclusively read and written inside {@code synchronized(this.gigaMap)}.
+		 */
+		private transient boolean readerStale;
+
+		///////////////////////////////////////////////////////////////////////////
+		// constructors //
+		/////////////////
+
+		protected Default(
+			final GigaMap<E>       gigaMap,
+			final LuceneContext<E> context
+		)
+		{
+			this(gigaMap, context, true);
+		}
+
+		protected Default(
+			final GigaMap<E>       gigaMap,
+			final LuceneContext<E> context,
+			final boolean          stateChanged
+		)
+		{
+			super(stateChanged);
+			this.gigaMap = gigaMap;
+			this.context = context;
+		}
+		
+		
+		
+		///////////////////////////////////////////////////////////////////////////
+		// methods //
+		////////////
+		
+		@Override
+		public GigaMap<E> parentMap()
+		{
+			return this.gigaMap;
+		}
+
+		@Override
+		public void internalAdd(final long entityId, final E entity)
+		{
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.ensureWriter();
+
+					this.writer.addDocument(this.toDocument(entityId, entity));
+					this.readerStale = true;
+                    this.optCommit();
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+		
+		@Override
+		public void internalAddAll(final long firstEntityId, final Iterable<? extends E> entities)
+		{
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.ensureWriter();
+
+					final List<Document> documents       = new ArrayList<>();
+					long                 currentEntityId = firstEntityId;
+					
+					for(final E entity : entities)
+					{
+						documents.add(this.toDocument(currentEntityId++, entity));
+					}
+					
+					this.writer.addDocuments(documents);
+					this.readerStale = true;
+                    this.optCommit();
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+		
+		@Override
+		public void internalRemove(final long entityId, final E entity)
+		{
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.ensureWriter();
+
+					this.writer.deleteDocuments(queryFor(entityId));
+					this.readerStale = true;
+                    this.optCommit();
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+		
+		@Override
+		public void internalRemoveAll()
+		{
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.ensureWriter();
+
+					this.writer.deleteAll();
+					this.readerStale = true;
+                    this.optCommit();
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+
+		@Override
+		public void internalOnRegistered()
+		{
+			// the GigaMap may already hold entities at the moment this index is registered; index them
+			// now so a full-text search sees pre-existing entities, not only those added afterwards.
+			this.internalRebuild(false);
+		}
+
+		@Override
+		public void internalReindex(final GigaMap<E> parentMap)
+		{
+			// Rebuild the whole index from the current entity state to recover from a stale index (e.g. an
+			// entity mutated directly instead of via update()/apply()). The existing documents are dropped
+			// first; otherwise this is the same batched back-fill as registration.
+			this.internalRebuild(true);
+		}
+
+		private void internalRebuild(final boolean clearFirst)
+		{
+			// Documents are added incrementally (no per-entity commit, no buffering of the whole corpus)
+			// and committed once at the end via optCommit, which honors the manual-commit contract: with
+			// context.autoCommit() == false the back-fill performs no commit, leaving durability to the
+			// user's explicit commit() (the near-real-time reader makes the documents queryable at the
+			// next search, just like internalAdd).
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.ensureWriter();
+
+					if(clearFirst)
+					{
+						this.writer.deleteAll();
+						this.readerStale = true;
+					}
+
+					this.gigaMap.iterateIndexed(this::backfillDocument);
+
+					// On a rebuild also commit when the map is empty, so the deleteAll itself is flushed.
+					if(clearFirst || !this.gigaMap.isEmpty())
+					{
+						this.optCommit();
+					}
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+
+		private void backfillDocument(final long entityId, final E entity)
+		{
+			// uses the GigaMap-assigned entityId (not a contiguous counter) so ENTITY_ID_FIELD stays the
+			// authoritative id that queryFor(entityId) relies on for later update/remove.
+			try
+			{
+				this.writer.addDocument(this.toDocument(entityId, entity));
+				this.readerStale = true;
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+
+		private Document toDocument(final long entityId, final E entity)
+		{
+			final Document document = new Document();
+			document.add(new LongField(ENTITY_ID_FIELD, entityId, Store.YES));
+			this.context.documentPopulator().populate(document, entity);
+			return document;
+		}
+
+		@Override
+		public void internalPrepareIndicesUpdate(final E replacedEntity)
+		{
+			// no-op
+		}
+		
+		@Override
+		public void internalFinishIndicesUpdate()
+		{
+			// no-op
+		}
+		
+		@Override
+		public void internalUpdateIndices(
+			final long                         entityId         ,
+			final E                            replacedEntity   ,
+			final E                            entity           ,
+			final CustomConstraints<? super E> customConstraints
+		)
+		{
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.ensureWriter();
+
+					this.writer.updateDocuments(queryFor(entityId), List.of(this.toDocument(entityId, entity)));
+					this.readerStale = true;
+                    this.optCommit();
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+		
+		@Override
+		public <A extends SearchResultAcceptor<? super E>> A query(final String queryText, final A searchResultAcceptor)
+		{
+			return this.query(queryText, this.defaultMaxResults(), searchResultAcceptor);
+		}
+		
+		@Override
+		public <A extends SearchResultAcceptor<? super E>> A query(
+			final String queryText           ,
+			final int    maxResults          ,
+			final A      searchResultAcceptor
+		)
+		{
+			if(maxResults <= 0)
+			{
+				return searchResultAcceptor;
+			}
+			
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.refreshReaderIfNeeded();
+
+					final StandardQueryParser queryParser = new StandardQueryParser(this.analyzer);
+					queryParser.setAllowLeadingWildcard(true);
+					final Query query = queryParser.parse(queryText, ENTITY_ID_FIELD);
+					this.syncInternalQuery(query, maxResults, searchResultAcceptor);
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+			catch(final QueryNodeException e)
+			{
+				throw new RuntimeException(e);
+			}
+			
+			return searchResultAcceptor;
+		}
+		
+		@Override
+		public <A extends SearchResultAcceptor<? super E>> A query(final Query query, final A searchResultAcceptor)
+		{
+			return this.query(query, this.defaultMaxResults(), searchResultAcceptor);
+		}
+		
+		@Override
+		public <A extends SearchResultAcceptor<? super E>> A query(
+			final Query query               ,
+			final int   maxResults          ,
+			final A     searchResultAcceptor
+		)
+		{
+			// Lucene's IndexSearcher.search(query, numHits) rejects numHits <= 0. A non-positive limit
+			// simply means "no results wanted", which most notably happens for the default-maxResults
+			// overloads on an empty map (defaultMaxResults() derives from gigaMap.size()), so return the
+			// unmodified acceptor instead of throwing - just like the sibling overloads do.
+			if(maxResults <= 0)
+			{
+				return searchResultAcceptor;
+			}
+
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.refreshReaderIfNeeded();
+
+					this.syncInternalQuery(query, maxResults, searchResultAcceptor);
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+			
+			return searchResultAcceptor;
+		}
+
+
+
+		private <A extends SearchResultAcceptor<? super E>> void syncInternalQuery(
+			final Query query               ,
+			final int   maxResults          ,
+			final A     searchResultAcceptor
+		)
+		throws IOException
+		{
+			final StoredFields storedFields = this.searcher.storedFields();
+			final Set<String>  idOnly       = new HashSet<>(List.of(ENTITY_ID_FIELD));
+			final TopDocs      topDocs      = this.searcher.search(query, maxResults);
+			for(final ScoreDoc scoreDoc : topDocs.scoreDocs)
+			{
+				final long entityId = storedFields
+					.document(scoreDoc.doc, idOnly)
+					.getField(ENTITY_ID_FIELD).numericValue().longValue()
+				;
+				final E entity;
+				if((entity = this.gigaMap.get(entityId)) != null)
+				{
+					searchResultAcceptor.accept(entityId, entity, scoreDoc.score);
+				}
+			}
+		}
+
+		@Override
+		public LuceneSearchResult<E> search(final Query query)
+		{
+			return this.search(notNull(query), this.defaultMaxResults());
+		}
+
+		@Override
+		public LuceneSearchResult<E> search(final String queryText)
+		{
+			return this.search(notNull(queryText), this.defaultMaxResults());
+		}
+
+		@Override
+		public LuceneSearchResult<E> search(final Query query, final int maxResults)
+		{
+			notNull(query);
+			if(maxResults <= 0)
+			{
+				return new LuceneSearchResult.Default<>(X.empty());
+			}
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.refreshReaderIfNeeded();
+					return this.syncInternalSearch(query, maxResults);
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+		}
+
+		@Override
+		public LuceneSearchResult<E> search(final String queryText, final int maxResults)
+		{
+			notNull(queryText);
+			if(maxResults <= 0)
+			{
+				return new LuceneSearchResult.Default<>(X.empty());
+			}
+			try
+			{
+				synchronized(this.gigaMap)
+				{
+					this.refreshReaderIfNeeded();
+
+					final StandardQueryParser queryParser = new StandardQueryParser(this.analyzer);
+					queryParser.setAllowLeadingWildcard(true);
+					final Query query = queryParser.parse(queryText, ENTITY_ID_FIELD);
+					return this.syncInternalSearch(query, maxResults);
+				}
+			}
+			catch(final IOException e)
+			{
+				throw new IORuntimeException(e);
+			}
+			catch(final QueryNodeException e)
+			{
+				throw new RuntimeException(e);
+			}
+		}
+
+		private LuceneSearchResult<E> syncInternalSearch(final Query query, final int maxResults)
+		throws IOException
+		{
+			final StoredFields                          storedFields = this.searcher.storedFields();
+			final Set<String>                           idOnly       = new HashSet<>(List.of(ENTITY_ID_FIELD));
+			final TopDocs                               topDocs      = this.searcher.search(query, maxResults);
+			final BulkList<ScoredSearchResult.Entry<E>> entries      = BulkList.New(topDocs.scoreDocs.length);
+			for(final ScoreDoc scoreDoc : topDocs.scoreDocs)
+			{
+				final long entityId = storedFields
+					.document(scoreDoc.doc, idOnly)
+					.getField(ENTITY_ID_FIELD).numericValue().longValue()
+				;
+				entries.add(new ScoredSearchResult.Entry.Default<>(entityId, scoreDoc.score, this.gigaMap));
+			}
+			return new LuceneSearchResult.Default<>(entries);
+		}
+		
+		@Override
+		public void clearStateChangeMarkers()
+		{
+			// no-op
+		}
+
+        @Override
+        public void commit()
+        {
+            synchronized(this.gigaMap)
+            {
+                if(this.writer != null)
+                {
+                    try
+                    {
+                        this.internalCommit();
+                    }
+                    catch(final IOException e)
+                    {
+                        throw new IORuntimeException(e);
+                    }
+                }
+            }
+        }
+
+		@Override
+		protected final void storeChildren(final Storer storer)
+		{
+			// this is just a local, partial lock that does NOT protect the whole giga map storing process. See GigaMap#store.
+			synchronized(this.parentMap())
+			{
+				super.storeChildren(storer);
+			}
+		}
+
+		@Override
+		protected void storeChangedChildren(final Storer storer)
+		{
+			if(this.fileEntries != null)
+			{
+				storer.store(this.fileEntries);
+				storer.storeAll(this.fileEntries.values());
+			}
+		}
+
+		@Override
+		protected void clearChildrenStateChangeMarkers()
+		{
+			// no-op
+		}
+
+		@Override
+		public void close()
+		{
+			synchronized(this.gigaMap)
+			{
+				final Closeable[] closeables = {this.analyzer, this.writer, this.reader, this.directory};
+				for(final Closeable closeable : closeables)
+				{
+					if(closeable != null)
+					{
+						try
+						{
+							closeable.close();
+						}
+						catch(final IOException e)
+						{
+							throw new IORuntimeException(e);
+						}
+					}
+				}
+				
+				this.analyzer    = null;
+				this.directory   = null;
+				this.writer      = null;
+				this.reader      = null;
+				this.searcher    = null;
+				this.readerStale = false;
+			}
+		}
+
+        private int defaultMaxResults()
+        {
+			return XMath.cap_int(this.gigaMap.size());
+        }
+
+        /**
+         * Ensures the write side is initialized: {@link Default#directory}, {@link Default#analyzer} and
+         * {@link Default#writer}. Deliberately does <b>not</b> touch {@link Default#reader} or
+         * {@link Default#searcher}: reopening the near-real-time reader per mutation rebuilt reader and
+         * searcher once per document, which dominated ingest cost. Write paths therefore only mark the
+         * reader stale (see {@link Default#readerStale}); the reopen is deferred to the next search.
+         * <p>
+         * A failed initialization leaves no state behind: the fields are published only once the writer
+         * exists, so the next call retries instead of operating on a half-initialized index.
+         * <p>
+         * Must be called while holding the {@code this.gigaMap} monitor.
+         */
+        private void ensureWriter() throws IOException
+        {
+            if(this.writer != null)
+            {
+                return;
+            }
+
+            final Directory directory = this.createDirectory();
+            final Analyzer  analyzer  = this.context.analyzerCreator().createAnalyzer();
+            final IndexWriter indexWriter;
+            try
+            {
+                final IndexWriterConfig writerConfig = new IndexWriterConfig(analyzer);
+                if(this.usesGraphDirectory())
+                {
+                    // GraphDirectory stores index data in the persistent fileEntries map.
+                    // ConcurrentMergeScheduler would modify that map from background threads,
+                    // racing with GigaMap#store serialization. SerialMergeScheduler ensures
+                    // merges run on the caller's thread, which holds the GigaMap lock.
+                    writerConfig.setMergeScheduler(new SerialMergeScheduler());
+                }
+                indexWriter = new IndexWriter(
+                    directory,
+                    writerConfig
+                );
+            }
+            catch(final Throwable t)
+            {
+                // e.g. the writer lock is held elsewhere: discard what was created so far instead of
+                // leaking it, and let the caller decide whether to retry.
+                IOUtils.closeWhileHandlingException(analyzer, directory);
+                throw t;
+            }
+
+            this.directory = directory;
+            this.analyzer  = analyzer;
+            this.writer    = indexWriter;
+        }
+
+        /**
+         * Ensures {@link Default#searcher} reflects all writer mutations performed so far, opening the
+         * near-real-time reader on first use and reopening it only when a mutation marked it stale. This is
+         * the read-path counterpart of {@link Default#ensureWriter()} and the only place where the reader is
+         * (re)opened.
+         * <p>
+         * Read-your-writes is preserved: a reader opened from the writer includes buffered, uncommitted
+         * changes, and {@link DirectoryReader#openIfChanged(DirectoryReader)} on such a writer-derived reader
+         * performs the same near-real-time reopen the write path used to do eagerly. Only the timing moves
+         * from per-write to next-read.
+         * <p>
+         * Must be called while holding the {@code this.gigaMap} monitor.
+         */
+        private void refreshReaderIfNeeded() throws IOException
+        {
+            // a read can be the very first operation on this index, so the writer may not exist yet.
+            // This also initializes the analyzer, which the query-string read paths use.
+            this.ensureWriter();
+
+            if(this.reader != null && !this.readerStale)
+            {
+                // no mutation since the last refresh, so the current searcher is up to date.
+                return;
+            }
+
+            if(this.reader == null)
+            {
+                // first read after initialization or after close(): a reader opened from the writer already
+                // reflects everything written so far, so no additional reopen is needed.
+                this.searcher = new IndexSearcher(
+                    this.reader = DirectoryReader.open(this.writer)
+                );
+            }
+            else
+            {
+                final DirectoryReader newReader = DirectoryReader.openIfChanged(this.reader);
+                if(newReader != null && newReader != this.reader)
+                {
+                    final DirectoryReader supersededReader = this.reader;
+                    this.searcher = new IndexSearcher(
+                        this.reader = newReader
+                    );
+
+                    // closed only after the new reader is published: a failing close must not leak the
+                    // reader that was just opened, and it leaves the index on the up-to-date one.
+                    supersededReader.close();
+                }
+            }
+
+            // cleared only after a successful (re)open, so an IOException leaves the index stale and the
+            // next search retries.
+            this.readerStale = false;
+        }
+
+		private boolean usesGraphDirectory()
+		{
+			return this.context.directoryCreator() == null;
+		}
+
+		private Directory createDirectory()
+		{
+			return this.usesGraphDirectory()
+				? new GraphDirectory()
+				: this.context.directoryCreator().createDirectory()
+			;
+		}
+
+        private void optCommit() throws IOException
+        {
+            if(this.context.autoCommit())
+            {
+                this.internalCommit();
+            }
+
+			this.markStateChangeChildren();
+        }
+
+        /**
+         * Couples the Lucene commit to the {@link GigaMap} store boundary when
+         * {@link LuceneContext#autoCommit()} is {@code false}: invoked by
+         * {@link BinaryHandlerLuceneIndexDefault#store} right before the index is serialized,
+         * it flushes and commits any pending writer changes so the persisted state reflects all
+         * mutations up to this {@code store()} exactly. For a graph directory this populates the
+         * {@link Default#fileEntries} map before it is read for serialization; for an external
+         * directory it syncs the on-disk index at the store boundary.
+         * <p>
+         * No-op when {@code autoCommit()} is {@code true} (the eager commits already ran), when
+         * the writer has not been initialized yet, or when there are no uncommitted changes.
+         */
+        void internalCommitOnStore()
+        {
+            synchronized(this.gigaMap)
+            {
+                if(!this.context.autoCommit()
+                    && this.writer != null
+                    && this.writer.hasUncommittedChanges())
+                {
+                    try
+                    {
+                        this.internalCommit();
+                    }
+                    catch(final IOException e)
+                    {
+                        throw new IORuntimeException(e);
+                    }
+                }
+            }
+        }
+
+        private void internalCommit() throws IOException
+        {
+            this.writer.flush();
+            this.writer.commit();
+        }
+
+
+		/**
+		 * {@link Directory} implementation which stores index data inside {@link Default#fileEntries}.
+		 * <p>
+		 * This connects the lucene data with the persistent object graph.
+		 */
+		class GraphDirectory extends BaseDirectory
+		{
+			private final AtomicLong fileNameCounter = new AtomicLong();
+
+			public GraphDirectory()
+			{
+				super(new TransientSingleInstanceLockFactory());
+			}
+
+			ConcurrentHashMap<String, FileEntry> fileEntries()
+			{
+				if(LuceneIndex.Default.this.fileEntries == null)
+				{
+					LuceneIndex.Default.this.fileEntries = new ConcurrentHashMap<>();
+				}
+				return LuceneIndex.Default.this.fileEntries;
+			}
+
+			@Override
+			public String[] listAll() throws IOException
+			{
+				this.ensureOpen();
+
+				return this.fileEntries().keySet().stream().sorted().toArray(String[]::new);
+			}
+
+			@Override
+			public void deleteFile(final String name) throws IOException
+			{
+				this.ensureOpen();
+
+				final FileEntry removed = this.fileEntries().remove(name);
+				if(removed == null)
+				{
+					throw new NoSuchFileException(name);
+				}
+			}
+
+			@Override
+			public long fileLength(final String name) throws IOException
+			{
+				this.ensureOpen();
+
+				final FileEntry file = this.fileEntries().get(name);
+				if(file == null)
+				{
+					throw new NoSuchFileException(name);
+				}
+				return file.length();
+			}
+
+			@Override
+			public IndexOutput createOutput(final String name, final IOContext context) throws IOException
+			{
+				this.ensureOpen();
+
+				final FileEntry e = new FileEntry(name);
+				if(this.fileEntries().putIfAbsent(name, e) != null)
+				{
+					throw new FileAlreadyExistsException("File already exists: " + name);
+				}
+				return e.createOutput();
+			}
+
+			@Override
+			public IndexOutput createTempOutput(final String prefix, final String suffix, final IOContext context)
+				throws IOException
+			{
+				this.ensureOpen();
+
+				final ConcurrentHashMap<String, FileEntry> fileEntries = this.fileEntries();
+				while(true)
+				{
+					final String tempFileName = suffix + "_" + Long.toString(this.fileNameCounter.getAndIncrement(), Character.MAX_RADIX);
+					final String name = IndexFileNames.segmentFileName(prefix, tempFileName, "tmp");
+					final FileEntry e = new FileEntry(name);
+					if(fileEntries.putIfAbsent(name, e) == null)
+					{
+						return e.createOutput();
+					}
+				}
+			}
+
+			@Override
+			public void rename(final String source, final String dest) throws IOException
+			{
+				this.ensureOpen();
+
+				final ConcurrentHashMap<String, FileEntry> fileEntries = this.fileEntries();
+				final FileEntry file = fileEntries.get(source);
+				if(file == null)
+				{
+					throw new NoSuchFileException(source);
+				}
+				if(fileEntries.putIfAbsent(dest, file) != null)
+				{
+					throw new FileAlreadyExistsException(dest);
+				}
+				if(!fileEntries.remove(source, file))
+				{
+					throw new IllegalStateException("File was unexpectedly replaced: " + source);
+				}
+				fileEntries.remove(source);
+			}
+
+			@Override
+			public void sync(final Collection<String> names) throws IOException
+			{
+				this.ensureOpen();
+			}
+
+			@Override
+			public void syncMetaData() throws IOException
+			{
+				this.ensureOpen();
+			}
+
+			@Override
+			public IndexInput openInput(final String name, final IOContext context) throws IOException
+			{
+				this.ensureOpen();
+				final FileEntry e = this.fileEntries().get(name);
+				if(e == null)
+				{
+					throw new NoSuchFileException(name);
+				}
+				else
+				{
+					return e.openInput();
+				}
+			}
+
+			@Override
+			public void close()
+			{
+				// no-op
+			}
+
+			@Override
+			public Set<String> getPendingDeletions()
+			{
+				return Collections.emptySet();
+			}
+
+		}
+
+
+		static final class FileEntry
+		{
+			private final String        fileName    ;
+
+			private volatile IndexInput content     ;
+			private volatile long       cachedLength;
+
+			FileEntry(final String name)
+			{
+				this.fileName = name;
+			}
+
+			long length()
+			{
+				// We return 0 length until the IndexOutput is closed and flushed.
+				return this.cachedLength;
+			}
+
+			IndexInput openInput() throws IOException
+			{
+				final IndexInput local = this.content;
+				if(local == null)
+				{
+					throw new AccessDeniedException("Can't open a file still open for writing: " + this.fileName);
+				}
+
+				return local.clone();
+			}
+
+			IndexOutput createOutput() throws IOException
+			{
+				if(this.content != null)
+				{
+					throw new IOException("Can only write to a file once: " + this.fileName);
+				}
+
+				final String clazzName = ByteBuffersDirectory.class.getSimpleName();
+				final String outputName = String.format(Locale.ROOT, "%s output (file=%s)", clazzName, this.fileName);
+
+				return new ByteBuffersIndexOutput(
+					new ByteBuffersDataOutput(),
+					outputName,
+					this.fileName,
+					new CRC32(),
+					(output) ->
+					{
+						this.content = this.outputToInput(output);
+						this.cachedLength = output.size();
+					}
+				);
+			}
+
+			IndexInput outputToInput(final ByteBuffersDataOutput output)
+			{
+				final ByteBuffersDataInput dataInput = output.toDataInput();
+				final String inputName =
+					String.format(
+						Locale.ROOT,
+						"%s (file=%s, buffers=%s)",
+						ByteBuffersIndexInput.class.getSimpleName(),
+						this.fileName,
+						dataInput
+					);
+				return new ByteBuffersIndexInput(dataInput, inputName);
+			}
+
+		}
+
+
+		static class TransientSingleInstanceLockFactory extends LockFactory
+		{
+			private transient volatile SingleInstanceLockFactory lockFactory;
+
+			public TransientSingleInstanceLockFactory()
+			{
+				super();
+			}
+
+			private LockFactory lockFactory()
+			{
+				/*
+				 * Double-checked locking to reduce the overhead of acquiring a lock
+				 * by testing the locking criterion.
+				 * The field (this.lockFactory) has to be volatile.
+				 */
+				SingleInstanceLockFactory lockFactory = this.lockFactory;
+				if(lockFactory == null)
+				{
+					synchronized(this)
+					{
+						if((lockFactory = this.lockFactory) == null)
+						{
+							lockFactory = this.lockFactory = new SingleInstanceLockFactory();
+						}
+					}
+				}
+				return lockFactory;
+			}
+
+			@Override
+			public Lock obtainLock(final Directory dir, final String lockName) throws IOException
+			{
+				return this.lockFactory().obtainLock(dir, lockName);
+			}
+
+		}
+		
+	}
+	
+	/**
+	 * Creates a new instance of {@code LuceneIndex.Category} for the specified {@code LuceneContext}.
+	 * This method facilitates the creation of a category associated with a given context.
+	 *
+	 * @param <E> the type of the entities managed by this category
+	 * @param context the {@code LuceneContext} instance to be associated with the category
+	 * @return a new {@code LuceneIndex.Category} instance bound to the specified context
+	 */
+	public static <E> Category<E> Category(final LuceneContext<E> context)
+	{
+		return new Category.Default<>(
+			notNull(context)
+		);
+	}
+	
+	
+	public interface Category<E> extends IndexCategory<E, LuceneIndex<E>>
+	{
+		@Override
+		public Class<LuceneIndex<E>> indexType();
+		
+		
+		public class Default<E> implements Category<E>
+		{
+			private final LuceneContext<E> context;
+			
+			
+			///////////////////////////////////////////////////////////////////////////
+			// constructors //
+			/////////////////
+			
+			Default(final LuceneContext<E> context)
+			{
+				super();
+				this.context = context;
+			}
+			
+			
+			
+			///////////////////////////////////////////////////////////////////////////
+			// methods //
+			////////////
+			
+			@SuppressWarnings({ "unchecked", "rawtypes" })
+			@Override
+			public Class<LuceneIndex<E>> indexType()
+			{
+				return (Class)LuceneIndex.class;
+			}
+			
+			@Override
+			public Internal<E> createIndexGroup(final GigaMap<E> gigaMap)
+			{
+				return new LuceneIndex.Default<>(gigaMap, this.context);
+			}
+			
+		}
+		
+	}
+	
+}

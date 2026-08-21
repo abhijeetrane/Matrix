@@ -1,0 +1,36 @@
+= Serializer
+
+The Eclipse Serializer is {product-name}'s serialization engine.
+While it powers the storage layer internally, it can also be used as a standalone, high-performance replacement for standard Java serialization.
+It converts Java objects to a compact binary format and back, handling complex object graphs including circular references, polymorphism, and collections.
+
+== Key Features
+
+* *High performance* — optimized binary format with minimal overhead
+* *Full object graph support* — handles circular references, shared references, and deep object hierarchies
+* *Automatic type handling* — new types are registered on demand during serialization
+* *Type evolution* — built-in support for xref:storage:legacy-type-mapping/index.adoc[legacy type mapping] when class structures change
+* *No annotations required* — works with plain Java objects without any modifications
+* *Pluggable architecture* — customize type handlers, configuration, and serialization behavior
+
+== Overview
+
+The serializer is structured into several layers:
+
+* *Serializer API* — the main entry point (`Serializer`, `TypedSerializer`) for converting objects to and from binary format
+* *Type Handling* — manages type registration, type dictionaries, and type evolution
+* *Persistence Engine* — the binary persistence layer that handles the actual data conversion
+* *Custom Type Handlers* — extension points for controlling how specific types are serialized
+
+== Getting Started
+
+See xref:serializer:getting-started.adoc[Getting Started] for setup instructions and basic usage examples.
+
+== Topics
+
+* xref:serializer:getting-started.adoc[Getting Started] — prerequisites, basic serialization and deserialization
+* xref:serializer:type-handling.adoc[Type Handling] — type dictionaries, import/export, and type registration
+* xref:serializer:typed-serializer.adoc[TypedSerializer] — self-describing serialized output with type information strategies
+* xref:serializer:custom-type-handlers.adoc[Custom Type Handlers] — developing serialization handlers for your domain types
+* xref:serializer:configuration.adoc[Configuration] — configuring the serializer via `SerializerFoundation`
+* xref:serializer:performance.adoc[Performance and Thread Safety] — optimization strategies, buffer sizes, and concurrency guarantees

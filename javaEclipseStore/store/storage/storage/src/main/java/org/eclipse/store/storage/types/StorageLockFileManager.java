@@ -1,0 +1,637 @@
+package org.eclipse.store.storage.types;
+
+/*-
+ * #%L
+ * EclipseStore Storage
+ * %%
+ * Copyright (C) 2023 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import static org.eclipse.serializer.util.X.notNull;
+
+import java.nio.ByteBuffer;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import org.eclipse.serializer.afs.types.AFile;
+import org.eclipse.serializer.afs.types.AFileSystem;
+import org.eclipse.serializer.chars.VarString;
+import org.eclipse.serializer.collections.ArrayView;
+import org.eclipse.serializer.memory.XMemory;
+import org.eclipse.serializer.util.X;
+import org.eclipse.serializer.util.logging.Logging;
+import org.eclipse.store.storage.exceptions.StorageException;
+import org.slf4j.Logger;
+
+/**
+ * The StorageLockFileManager's purpose is to provide a mechanism that prevents
+ * other storage instances running in different processes from accessing the
+ * storage data.
+ */
+public interface StorageLockFileManager extends Runnable
+{
+	/**
+	 * Start periodic lock file checks.
+	 *
+	 * @return this
+	 */
+	public StorageLockFileManager start();
+
+	/**
+	 * Stop periodic lock file checks.
+	 *
+	 * @return this
+	 */
+	public StorageLockFileManager stop();
+	
+	/**
+	 * Initialize the lock file manager without starting any periodic actions.
+	 */
+	public void initialize();
+	
+	/**
+	 * Check if the StorageLockFileManager has been successfully initialized and is ready to start.
+	 * 
+	 * @return true if {@link #initialize()} was successfully executed.
+	 */
+	public boolean isInitialized();
+		
+	
+	public static StorageLockFileManager New(
+		final StorageLockFileSetup                 setup              ,
+		final StorageOperationController           operationController,
+		final StorageLockFileManagerThreadProvider threadProvider
+	)
+	{
+		return new StorageLockFileManager.Default(
+			notNull(setup),
+			notNull(operationController),
+			notNull(threadProvider)
+		);
+	}
+	
+	/**
+	 * Default implementation of {@link StorageLockFileManager}.
+	 * This implementation uses a file to indicate if the storage data
+	 * is already in use by a storage instance.
+	 * The file contains a process-dependent ID and timestamps of the last modification
+	 * and the expiration time.
+	 * A storage is accessible if:
+	 * - no lock file exists
+	 * - a lock file exists and the process id matches
+	 * - a lock file exists and the current system time is greater than the expiration time + update interval
+	 */
+	public final class Default implements StorageLockFileManager
+	{
+		private final static Logger logger = Logging.getLogger(StorageLockFileManager.class);
+		
+		///////////////////////////////////////////////////////////////////////////
+		// instance fields //
+		////////////////////
+		
+		private final StorageLockFileSetup               setup              ;
+		private final StorageOperationController         operationController;
+		
+		// cached values
+		private transient StorageLockFile                lockFile                ;
+		private transient LockFileData                   lockFileData            ;
+		private transient String                         sessionNonce            ;
+		private final transient ByteBuffer[]             wrappedByteBuffer       ;
+		private final transient ArrayView<ByteBuffer>    wrappedWrappedByteBuffer;
+		private transient ByteBuffer                     directByteBuffer        ;
+		private transient byte[]                         stringReadBuffer        ;
+		private final transient VarString                vs                      ;
+		private final transient AFileSystem              fileSystem              ;
+		private final transient ScheduledExecutorService executor                ;
+		
+		
+		///////////////////////////////////////////////////////////////////////////
+		// constructors //
+		/////////////////
+		
+		Default(
+			final StorageLockFileSetup                 setup              ,
+			final StorageOperationController           operationController,
+			final StorageLockFileManagerThreadProvider threadProvider
+		)
+		{
+			super();
+			this.setup               = setup              ;
+			this.fileSystem          = setup.lockFileProvider().fileSystem();
+			this.operationController = operationController;
+			this.vs                  = VarString.New()    ;
+			// timestamps, nonce and identifier with separators; the buffer grows on demand if needed.
+			this.wrappedByteBuffer = new ByteBuffer[1];
+			this.wrappedWrappedByteBuffer = X.ArrayView(this.wrappedByteBuffer);
+
+			this.stringReadBuffer = new byte[64];
+			this.allocateBuffer(this.stringReadBuffer.length);
+			
+			this.executor = Executors.newSingleThreadScheduledExecutor(threadProvider);
+		}
+		
+		
+		
+		///////////////////////////////////////////////////////////////////////////
+		// methods //
+		////////////
+
+		
+		@Override
+		public final synchronized boolean isInitialized()
+		{
+			return this.lockFile != null;
+		}
+		
+		private synchronized boolean isReady()
+		{
+			final boolean result = this.isInitialized() && this.operationController.checkProcessingEnabled();
+			logger.trace("Storage LockFile Manager isReady: {}" , result);
+			return result;
+		}
+		
+		@Override
+		public StorageLockFileManager.Default start()
+		{
+			logger.info("Starting lock file manager thread");
+			this.executor.scheduleWithFixedDelay(this, 0, this.setup.updateInterval(), TimeUnit.MILLISECONDS);
+			return this;
+		}
+
+		@Override
+		public final void run()
+		{
+			try
+			{
+				if(this.isReady())
+				{
+					this.updateFile();
+				}
+				else
+				{
+					// controller deactivated (teardown) without a disruption: nothing to recover. Shut the
+					// executor down and release the lock file here rather than ticking forever. Done inline
+					// instead of via stop() because this runs on the executor's own worker thread, which
+					// cannot join itself in awaitTermination.
+					logger.info("Lock file manager no longer ready, stopping.");
+					this.executor.shutdown();
+					this.ensureClosedLockFile(null);
+				}
+			}
+			catch(final Exception e)
+			{
+				// Same rationale as the else-branch above: this runs on the executor's own worker thread, so
+				// shut the executor down and close the lock file inline (stop()'s awaitTermination would
+				// self-join), then register the disruption and rethrow.
+				this.executor.shutdown();
+				this.ensureClosedLockFile(null);
+				this.operationController.registerDisruption(e);
+				throw e;
+			}
+		}
+		
+		@Override
+		public StorageLockFileManager stop()
+		{
+			// No early return on an already-shutdown executor: initialize()'s refusal path shuts it down
+			// before throwing, so the lock file must still be closed here. awaitTermination joins any
+			// still-running task before the finally closes the file, avoiding a close-vs-read race.
+			this.executor.shutdown();
+			try
+			{
+				if(!this.executor.awaitTermination(100, TimeUnit.MILLISECONDS))
+				{
+					this.executor.shutdownNow();
+					if (!this.executor.awaitTermination(100, TimeUnit.MILLISECONDS))
+					{
+						logger.error("Failed to shutdown StorageLockFileManager Service executor!");
+					}
+				}
+			}
+			catch(final InterruptedException e)
+			{
+				this.executor.shutdownNow();
+				Thread.currentThread().interrupt();
+			}
+			finally
+			{
+				this.ensureClosedLockFile(null);
+			}
+			
+			logger.info("Storage Lock File Manager stopped");
+			
+			return this;
+		}
+		
+		/**
+		 * Initialize the storage lock file manager without starting the periodic
+		 * lock file check.
+		 */
+		@Override
+		public void initialize()
+		{
+			logger.info("initializing lock file manager for storage {}", this.setup.processIdentity());
+
+			final StorageLiveFileProvider fileProvider = this.setup.lockFileProvider();
+			final AFile lockFile     = fileProvider.provideLockFile();
+			this.lockFile = StorageLockFile.New(lockFile);
+
+			// Absent lock file => legitimate fresh start. Present but unreadable => fail closed (see
+			// #readExistingLockFileDataOrNull): an existing-but-unparseable lock (another process' truncate
+			// window, a torn write) must not be treated as free, or two writers could both claim.
+			final LockFileData existing = this.readExistingLockFileDataOrNull();
+			if(existing != null && !this.validateExistingLockFileData(existing))
+			{
+				throw new StorageException("Storage already in use by: " + existing.identifier);
+			}
+
+			if(this.isReadOnlyMode())
+			{
+				// read-only never claims; only remember the current owner (if any) to detect a later takeover.
+				this.sessionNonce = existing != null ? existing.nonce : null;
+				return;
+			}
+
+			// Claim with a fresh per-session nonce, then verify the claim survived a concurrent claimer
+			// before the caller runs recovery writes (initialize() completes before startup recovery).
+			this.sessionNonce = newNonce();
+			this.lockFileData = new LockFileData(this.setup.processIdentity(), this.sessionNonce, this.setup.updateInterval());
+
+			this.lockFile.file().ensureExists();
+			this.writeLockFileData();
+			this.verifyClaim();
+		}
+
+		/**
+		 * Reads the current lock file content. Returns {@code null} only if the lock file does not exist
+		 * (a legitimate fresh start). If the file exists but cannot be parsed (empty, torn or partial
+		 * write), it fails closed rather than treating the storage as free.
+		 */
+		private LockFileData readExistingLockFileDataOrNull()
+		{
+			if(!this.lockFile.exists())
+			{
+				return null;
+			}
+
+			try
+			{
+				return this.readLockFileData();
+			}
+			catch(final StorageException e)
+			{
+				throw new StorageException(
+					"Storage lock file is present but unreadable; refusing to start to avoid split-brain.",
+					e
+				);
+			}
+		}
+
+		/**
+		 * Confirms our just-written claim is still on disk before any recovery write happens. If a
+		 * concurrent process overwrote it, the nonce differs and startup is aborted.
+		 */
+		private void verifyClaim()
+		{
+			final LockFileData current = this.readLockFileData();
+			if(!this.sessionNonce.equals(current.nonce))
+			{
+				throw new StorageException(
+					"Storage already in use: lock claim was overwritten by a concurrent process ("
+					+ current.identifier + ")."
+				);
+			}
+		}
+
+		private static String newNonce()
+		{
+			// Fresh per-session identity: distinguishes our writes from a foreign takeover and from a
+			// previous session that reused the same process identity.
+			return UUID.randomUUID().toString();
+		}
+		
+		
+		private boolean validateExistingLockFileData(final LockFileData lockFileData)
+		{
+					
+			final String identifier = this.setup.processIdentity();
+			if(identifier.equals(lockFileData.identifier))
+			{
+				// database is already owned by "this" process (e.g. crash shortly before), so just continue and reuse.
+				logger.info("Storage already owned by process!");
+				return true;
+			}
+			
+			if(lockFileData.isLongExpired())
+			{
+				/*
+				 * The lock file is no longer updated, meaning the database is not used anymore
+				 * and the lockfile is just a zombie, probably left by a crash.
+				 */
+				logger.info("Storage lock file outdated, acquiring storage!");
+				return true;
+			}
+			
+			logger.debug("Storage lock file not validated! Owner {}, expire time {}", lockFileData.identifier, lockFileData.expirationTime);
+			
+			return false;
+		}
+						
+		private ByteBuffer ensureReadingBuffer(final int fileLength)
+		{
+			this.ensureBufferCapacity(fileLength);
+			if(this.stringReadBuffer.length != fileLength)
+			{
+				this.stringReadBuffer = new byte[fileLength];
+			}
+			
+			this.directByteBuffer.clear();
+			
+			return this.directByteBuffer;
+		}
+		
+		private ArrayView<ByteBuffer> ensureWritingBuffer(final byte[] bytes)
+		{
+			this.ensureBufferCapacity(bytes.length);
+			this.directByteBuffer.clear();
+
+			return this.wrappedWrappedByteBuffer;
+		}
+		
+		private boolean ensureBufferCapacity(final int capacity)
+		{
+			if(this.directByteBuffer.capacity() >= capacity)
+			{
+				// already enough capacity
+				return false;
+			}
+			
+			/* data has to be copied multiple times in JDK to load a single String.
+			 * Note that using a byte[]-wrapping ByteBuffer is not better since
+			 * internally a TemporaryDirectBuffer is used for non-direct buffers that adds the copying step anyway.
+			 * The only reasonable thing to use with nio is the DirectByteBuffer.
+			 */
+			XMemory.deallocateDirectByteBuffer(this.directByteBuffer);
+			this.allocateBuffer(capacity);
+			
+			return true;
+		}
+		
+		private void allocateBuffer(final int capacity)
+		{
+			this.wrappedByteBuffer[0] = this.directByteBuffer = XMemory.allocateDirectNative(capacity);
+		}
+		
+		private String readString()
+		{
+			this.fillReadBufferFromFile();
+			
+			return new String(this.stringReadBuffer, this.setup.charset());
+		}
+		
+		private void fillReadBufferFromFile()
+		{
+			final int fileLength = X.checkArrayRange(this.lockFile.size());
+			this.lockFile.readBytes(this.ensureReadingBuffer(fileLength), 0, fileLength);
+			XMemory.copyRangeToArray(XMemory.getDirectByteBufferAddress(this.directByteBuffer), this.stringReadBuffer);
+		}
+		
+		private LockFileData readLockFileData()
+		{
+			// current format: lastWriteTime;expirationTime;nonce;identifier
+			// legacy format (pre-nonce): lastWriteTime;expirationTime;identifier
+			// The legacy form is tolerated so an existing lock file written by an older version does not
+			// fail closed on the first start after an upgrade; a fresh claim rewrites it in the current format.
+			final String s = this.readString();
+
+			final int i1 = s.indexOf(';');
+			final int i2 = i1 < 0 ? -1 : s.indexOf(';', i1 + 1);
+			if(i1 < 0 || i2 < 0)
+			{
+				throw new StorageException("Malformed storage lock file content.");
+			}
+			final int i3 = s.indexOf(';', i2 + 1);
+
+			try
+			{
+				final long   lastWriteTime  = Long.parseLong(s.substring(0, i1));
+				final long   expirationTime = Long.parseLong(s.substring(i1 + 1, i2));
+
+				final String nonce;
+				final String identifier;
+				if(i3 < 0)
+				{
+					// legacy: no nonce present.
+					nonce      = "";
+					identifier = s.substring(i2 + 1);
+				}
+				else
+				{
+					nonce      = s.substring(i2 + 1, i3);
+					identifier = s.substring(i3 + 1);
+				}
+
+				return new LockFileData(lastWriteTime, expirationTime, nonce, identifier);
+			}
+			catch(final NumberFormatException e)
+			{
+				throw new StorageException("Malformed storage lock file timestamps.", e);
+			}
+		}
+		
+		static final class LockFileData
+		{
+			      long   lastWriteTime ;
+			      long   expirationTime;
+			final String nonce         ;
+			final String identifier    ;
+			final long   updateInterval;
+
+			LockFileData(final String identifier, final String nonce, final long updateInterval)
+			{
+				super();
+				this.identifier     = identifier    ;
+				this.nonce          = nonce          ;
+				this.updateInterval = updateInterval ;
+			}
+
+			LockFileData(final long lastWriteTime, final long expirationTime, final String nonce, final String identifier)
+			{
+				this(identifier, nonce, deriveUpdateInterval(lastWriteTime, expirationTime));
+				this.lastWriteTime  = lastWriteTime ;
+				this.expirationTime = expirationTime;
+			}
+			
+			final void update()
+			{
+				this.lastWriteTime  = System.currentTimeMillis();
+				this.expirationTime = this.lastWriteTime + this.updateInterval;
+			}
+			
+			private static long deriveUpdateInterval(final long lastWriteTime, final long expirationTime)
+			{
+				final long derivedInterval = expirationTime - lastWriteTime;
+				if(derivedInterval <= 0)
+				{
+					throw new StorageException(
+						"Invalid lockfile timestamps: lastWriteTime = " + lastWriteTime
+						+ ", expirationTime = " + expirationTime
+					);
+				}
+				
+				return derivedInterval;
+			}
+			
+			/**
+			 * "long" meaning the expiration time has been passed by another interval.
+			 * This is a tolerance / grace time strategy to avoid mistaking a merely delayed
+			 * heartbeat (e.g. a brief pause or scheduling lag) for a dead owner.
+			 */
+			final boolean isLongExpired()
+			{
+				return System.currentTimeMillis() > this.expirationTime + this.updateInterval;
+			}
+			
+		}
+		
+		private boolean lockFileHasContent()
+		{
+			return this.lockFile.exists() && this.lockFile.size() > 0;
+		}
+		
+		
+		private void checkForModifiedLockFile()
+		{
+			if(this.isReadOnlyMode() && !this.lockFileHasContent())
+			{
+				// an absent lock file can be ignored in read-only mode.
+				return;
+			}
+			
+			// Self-fence: the on-disk nonce must still be the one this session claimed. Our own heartbeats
+			// keep the nonce stable (only timestamps change), so a mismatch means a foreign process took over.
+			final LockFileData current = this.readLockFileData();
+			if(this.sessionNonce != null && this.sessionNonce.equals(current.nonce))
+			{
+				return;
+			}
+
+			throw new StorageException(
+				"Concurrent lock file modification detected (foreign owner: " + current.identifier + ")."
+			);
+		}
+		
+		private boolean isReadOnlyMode()
+		{
+			return !this.fileSystem.isWritable();
+		}
+		
+		private void writeLockFileData()
+		{
+			if(this.isReadOnlyMode())
+			{
+				// do not write in read-only mode. But everything else (modification checking etc.) is still required.
+				return;
+			}
+			
+			this.lockFileData.update();
+						
+			final ArrayView<ByteBuffer> bb = this.setToWriteBuffer(this.lockFileData);
+			
+			// no need for the writer detour (for now) since it makes no sense to back up lock files.
+			
+			//don't delete file!
+			this.lockFile.truncate(0);
+			this.lockFile.writeBytes(bb);
+			
+		}
+		
+		private ArrayView<ByteBuffer> setToWriteBuffer(final LockFileData lockFileData)
+		{
+			this.vs.reset()
+			.add(lockFileData.lastWriteTime).add(';')
+			.add(lockFileData.expirationTime).add(';')
+			.add(lockFileData.nonce).add(';')
+			.add(lockFileData.identifier)
+			;
+			
+			final byte[] bytes = this.vs.encodeBy(this.setup.charset());
+			final ArrayView<ByteBuffer> bb = this.ensureWritingBuffer(bytes);
+			
+			XMemory.copyArrayToAddress(bytes, XMemory.getDirectByteBufferAddress(this.directByteBuffer));
+			this.directByteBuffer.limit(bytes.length);
+			
+			return bb;
+		}
+				
+		private void updateFile()
+		{
+			logger.trace("updating lock file");
+			
+			this.checkForModifiedLockFile();
+			this.writeLockFileData();
+		}
+		
+		private void ensureClosedLockFile(final Throwable cause)
+		{
+			if(this.lockFile == null)
+			{
+				return;
+			}
+		
+			logger.debug("closing lockfile!");
+			StorageClosableFile.close(this.lockFile, cause);
+			this.lockFile = null;
+		}
+		
+	}
+	
+	
+	public static Creator Creator()
+	{
+		return new Creator.Default();
+	}
+	
+	public interface Creator
+	{
+		public StorageLockFileManager createLockFileManager(
+			StorageLockFileSetup                 setup              ,
+			StorageOperationController           operationController,
+			StorageLockFileManagerThreadProvider threadProvider
+		);
+		
+		public final class Default implements StorageLockFileManager.Creator
+		{
+			Default()
+			{
+				super();
+			}
+
+			@Override
+			public StorageLockFileManager createLockFileManager(
+				final StorageLockFileSetup                 setup              ,
+				final StorageOperationController           operationController,
+				final StorageLockFileManagerThreadProvider threadProvider
+			)
+			{
+				return StorageLockFileManager.New(
+					setup              ,
+					operationController,
+					threadProvider
+				);
+			}
+			
+		}
+		
+	}
+	
+}

@@ -1,0 +1,49 @@
+= Redis
+
+[source, xml, subs=attributes+]
+----
+<dependency>
+	<groupId>org.eclipse.store</groupId>
+	<artifactId>afs-redis</artifactId>
+	<version>{maven-version}</version>
+</dependency>
+<dependency>
+	<groupId>io.lettuce</groupId>
+	<artifactId>lettuce-core</artifactId>
+	<version>6.5.3.RELEASE</version>
+</dependency>
+----
+
+[source, java]
+----
+String redisUri = "redis://localhost:6379/0";
+BlobStoreFileSystem fileSystem = BlobStoreFileSystem.New(
+	RedisConnector.Caching(redisUri)
+);
+EmbeddedStorage.start(fileSystem.ensureDirectoryPath("storage"));
+----
+
+== Configuration
+
+When using xref:configuration/index.adoc#external-configuration[external configuration] Redis can be set as follows.
+
+[source, properties, title="eclipsestore.properties"]
+----
+# optional, enforces checks
+storage-filesystem.target=redis
+
+storage-filesystem.redis.uri=redis://localhost:6379/0
+----
+
+[options="header",cols="1,2a,3"]
+|===
+|Property   
+|Description   
+|Type   
+//-------------
+|redis.uri
+|The RedisURI contains the host/port and can carry authentication/database details. On a successful connect you get authenticated, and the database is selected afterward. This applies also after re-establishing a connection after a connection loss.
+|String
+|===
+
+CAUTION: Depending on the amount of data and transactions, charges may apply depending on service usage. Please check with your service provider for details.

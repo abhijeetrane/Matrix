@@ -1,0 +1,44 @@
+package org.eclipse.store.gigamap.annotations;
+
+/*-
+ * #%L
+ * EclipseStore GigaMap
+ * %%
+ * Copyright (C) 2023 - 2025 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import org.eclipse.store.gigamap.types.GigaMap;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.Target;
+
+import static java.lang.annotation.ElementType.FIELD;
+import static java.lang.annotation.ElementType.METHOD;
+import static java.lang.annotation.RetentionPolicy.RUNTIME;
+
+/**
+ * An annotation to indicate that the annotated property must have a unique value across all instances of the class in a {@link GigaMap}.
+ * This is a marker annotation and does not contain any attributes.
+ * <p>
+ * This annotation enforces the uniqueness of the property it is applied to, often in the context of persistence or
+ * data modeling systems where ensuring unique values is required.
+ * <p>
+ * For annotation-based index generation this annotation is sufficient on its own: it creates a unique
+ * index for the property, so a companion {@link Index} is not required (though it may still be combined
+ * with {@link Index}).
+ * <p>
+ * The annotation is retained at runtime and can be applied to fields or no-argument getter methods.
+ */
+@Retention(RUNTIME)
+@Target({FIELD, METHOD})
+public @interface Unique
+{
+	// marker interface
+}

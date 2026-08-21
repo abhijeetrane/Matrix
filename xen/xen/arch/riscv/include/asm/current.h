@@ -1,0 +1,65 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
+#ifndef ASM__RISCV__CURRENT_H
+#define ASM__RISCV__CURRENT_H
+
+#include <xen/bug.h>
+#include <xen/cache.h>
+#include <xen/percpu.h>
+
+#include <asm/processor.h>
+
+#ifndef __ASSEMBLER__
+
+register struct pcpu_info *tp asm ( "tp" );
+
+struct pcpu_info {
+    unsigned int processor_id; /* Xen CPU id */
+    unsigned long hart_id; /* physical CPU id */
+} __cacheline_aligned;
+
+/* tp points to one of these */
+extern struct pcpu_info pcpu_info[NR_CPUS];
+
+/* Per-VCPU state that lives at the top of the stack */
+struct cpu_info {
+    /* This should be the first member. */
+    struct cpu_user_regs guest_cpu_user_regs;
+};
+
+#define set_processor_id(id)    do { \
+    tp->processor_id = (id);         \
+} while (0)
+
+static inline unsigned int smp_processor_id(void)
+{
+    unsigned int id = tp->processor_id;
+
+    BUG_ON(id >= NR_CPUS);
+
+    return id;
+}
+
+/* Which VCPU is "current" on this PCPU. */
+DECLARE_PER_CPU(struct vcpu *, curr_vcpu);
+
+#define current            this_cpu(curr_vcpu)
+#define set_current(vcpu)  do { current = (vcpu); } while (0)
+#define get_cpu_current(cpu)  per_cpu(curr_vcpu, cpu)
+
+#define guest_cpu_user_regs() ({ BUG_ON("unimplemented"); NULL; })
+#define vcpu_guest_cpu_user_regs(vcpu) \
+    (&(vcpu)->arch.cpu_info->guest_cpu_user_regs)
+
+#define switch_stack_and_jump(stack, fn) do {               \
+    asm volatile (                                          \
+            "mv sp, %0\n"                                   \
+            "jr %1" :: "r" (stack), "r" (fn) : "memory" );  \
+    unreachable();                                          \
+} while ( false )
+
+#define get_per_cpu_offset() __per_cpu_offset[smp_processor_id()]
+
+#endif /* __ASSEMBLER__ */
+
+#endif /* ASM__RISCV__CURRENT_H */

@@ -1,0 +1,213 @@
+package org.eclipse.store.storage.types;
+
+/*-
+ * #%L
+ * EclipseStore Storage
+ * %%
+ * Copyright (C) 2023 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+
+
+public interface StorageChannelSynchronizingTask extends StorageChannelTask
+{
+	public boolean isProcessed();
+
+	public void incrementProcessingProgress();
+
+	public void waitOnProcessing() throws InterruptedException;
+
+
+
+	/**
+	 * Per-channel boolean results of a completing task: each channel writes only its own slot
+	 * (a single shared flag would be a last-writer-wins race between the channel threads), the
+	 * issuer aggregates after the completion barrier, whose monitor provides the happens-before
+	 * edge for the reads.
+	 */
+	public final class ChannelResults
+	{
+		private final boolean[] results;
+
+		public ChannelResults(final int channelCount)
+		{
+			super();
+			this.results = new boolean[channelCount];
+		}
+
+		public void set(final int channelIndex, final boolean result)
+		{
+			this.results[channelIndex] = result;
+		}
+
+		/**
+		 * @return whether every channel reported {@code true}; one channel's failure or
+		 *         deferral must not be masked by another channel's success.
+		 */
+		public boolean allTrue()
+		{
+			for(final boolean result : this.results)
+			{
+				if(!result)
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		/**
+		 * @return whether any channel reported {@code true} - e.g. any channel rolled a file over,
+		 *         so every channel must make its files durable before the collapse can be relied on.
+		 */
+		public boolean anyTrue()
+		{
+			for(final boolean result : this.results)
+			{
+				if(result)
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+	}
+
+
+
+	public abstract class AbstractCompletingTask<R>
+	extends StorageChannelTask.Abstract<R>
+	implements StorageChannelSynchronizingTask
+	{
+		///////////////////////////////////////////////////////////////////////////
+		// constructors //
+		/////////////////
+
+		public AbstractCompletingTask(
+			final long                       timestamp   ,
+			final int                        channelCount, 
+			final StorageOperationController controller
+		)
+		{
+			super(timestamp, channelCount, controller);
+		}
+
+
+		///////////////////////////////////////////////////////////////////////////
+		// declared methods //
+		/////////////////////
+
+		protected void succeed(final StorageChannel channel, final R result)
+		{
+			// no-op by default. To be overridden only when needed.
+		}
+
+		protected void fail(final StorageChannel channel, final R result)
+		{
+			// no-op by default. To be overridden only when needed.
+		}
+
+		protected void postCompletionSuccess(final StorageChannel channel, final R result) throws InterruptedException
+		{
+			// no-op by default. To be overridden only when needed.
+		}
+
+		private void synchronizedComplete(final StorageChannel channel, final R result)
+		{
+			try
+			{
+				// handle success or failure
+				if(this.hasProblems())
+				{
+					// any other thread's storing failed, so rollback own storing
+					this.fail(channel, result);
+				}
+				else
+				{
+					this.succeed(channel, result);
+				}
+			}
+			catch(final Throwable t)
+			{
+				this.addProblem(channel.channelIndex(), t);
+			}
+			finally
+			{
+				// must complete the task (signal calling thread) no matter the result (success or problem)
+				this.incrementCompletionProgress();
+			}
+		}
+
+
+
+
+
+		///////////////////////////////////////////////////////////////////////////
+		// methods //
+		////////////
+
+		@Override
+		protected R internalProcessBy(final StorageChannel channel)
+		{
+			// no-op by default. To be overridden only when needed.
+			return null;
+		}
+
+		@Override
+		protected final void complete(final StorageChannel channel, final R result) throws InterruptedException
+		{
+			try
+			{
+				// wait for all other processing threads to report in before completing (e.g. committing a write)
+				this.waitOnProcessing();
+			}
+			catch(final InterruptedException e)
+			{
+				/* Thread interrupted. Register problem, pass exception along
+				 * but still care for consistency via finally block before leaving
+				 */
+				this.addProblem(channel.channelIndex(), e);
+				throw e; // passing the interruption basically means terminating the channel work loop
+			}
+			finally
+			{
+				// actual completion logic after (timely) synchronizing with other threads (or after interruption)
+				this.synchronizedComplete(channel, result);
+
+				// post-completion logic that may not be subject to completion try-catch-finally
+				if(!this.hasProblems())
+				{
+					this.postCompletionSuccess(channel, result);
+				}
+			}
+		}
+
+		@Override
+		protected final void completeExceptionally(final StorageChannel channel)
+		{
+			// own failure means fail() regardless of siblings, so unlike complete() this must NOT
+			// waitOnProcessing() first - see the contract for why waiting here would deadlock.
+			this.synchronizedComplete(channel, null);
+		}
+
+
+		public static final class Dummy extends AbstractCompletingTask<Void> implements StorageRequestTask
+		{
+
+			public Dummy(final int channelCount, StorageOperationController controller)
+			{
+				super(0, channelCount, controller);
+			}
+
+		}
+
+	}
+
+}

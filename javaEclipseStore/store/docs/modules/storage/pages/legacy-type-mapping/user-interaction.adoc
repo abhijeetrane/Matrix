@@ -1,0 +1,73 @@
+= User Interaction
+
+This page provides details on how Legacy Type Mapping communicates its results and how to customize the behavior.
+
+== Default Behavior
+
+By default, a `LoggingLegacyTypeMappingResultor` is used, which wraps the `PersistenceLegacyTypeMappingResultor`.
+It accepts all heuristic mappings and logs detected mappings via SLF4J.
+
+To see the mapping output during development, configure your logging framework to show log messages from the `LoggingLegacyTypeMappingResultor` class.
+
+== Disabling Logging
+
+To accept all mappings silently without any logging, use the `PersistenceLegacyTypeMappingResultor` directly:
+
+[source, java]
+----
+EmbeddedStorageFoundation<?> foundation = EmbeddedStorage.Foundation();
+
+foundation.onConnectionFoundation(f ->
+{
+    f.setLegacyTypeMappingResultor(
+        PersistenceLegacyTypeMappingResultor.New()
+    );
+});
+----
+
+== Custom Resultor Implementation
+
+You can implement a completely custom resultor by implementing `PersistenceLegacyTypeMappingResultor`.
+The method to override is `createMappingResult`, which receives the legacy type definition, the current type handler, explicit mappings, explicit new members, and heuristic match results:
+
+[source, java]
+----
+EmbeddedStorageFoundation<?> foundation = EmbeddedStorage.Foundation();
+
+foundation.onConnectionFoundation(f ->
+{
+    f.setLegacyTypeMappingResultor(new PersistenceLegacyTypeMappingResultor<>()
+    {
+        @Override
+        public <T> PersistenceLegacyTypeMappingResult<Binary, T> createMappingResult(
+            final PersistenceTypeDefinition                                                    legacyTypeDefinition,
+            final PersistenceTypeHandler<Binary, T>                                            currentTypeHandler  ,
+            final XGettingMap<PersistenceTypeDefinitionMember, PersistenceTypeDefinitionMember> explicitMappings    ,
+            final XGettingSet<PersistenceTypeDefinitionMember>                                 explicitNewMembers  ,
+            final MultiMatch<PersistenceTypeDefinitionMember>                                  matchedMembers
+        )
+        {
+            // Create the default mapping result
+            final PersistenceLegacyTypeMappingResult<Binary, T> result =
+                PersistenceLegacyTypeMappingResultor.createLegacyTypeMappingResult(
+                    legacyTypeDefinition, currentTypeHandler,
+                    explicitMappings, explicitNewMembers, matchedMembers
+                );
+
+            // Custom handling: log, validate, persist, etc.
+            logger.info("Legacy type mapping: {} -> {}",
+                result.legacyTypeDefinition().toTypeIdentifier(),
+                result.currentTypeHandler().toTypeIdentifier()
+            );
+
+            return result;
+        }
+    });
+});
+----
+
+Use cases for custom resultors:
+
+* Writing confirmed mappings to the refactoring CSV for future determinism
+* Integrating with external approval workflows
+* Sending notifications when schema changes are detected

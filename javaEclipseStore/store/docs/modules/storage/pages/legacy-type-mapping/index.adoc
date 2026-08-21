@@ -1,0 +1,625 @@
+= Legacy Type Mapping
+:description: Comprehensive guide to handling type evolution in {product-name}
+
+When the structure of a Java class changes after data has been persisted — fields renamed, added, removed, retyped, or the class itself renamed — the stored data no longer matches the current class definition.
+Traditional databases handle this through migration scripts that rewrite all affected records.
+{product-name} takes a different approach: *Legacy Type Mapping* transforms data on-the-fly as it is loaded, leaving the stored data untouched.
+
+This means:
+
+* No downtime for data migration
+* No risk of migration scripts failing partway through
+* Records remain compatible with all versions of their type
+* Transformation cost is only incurred when data is actually loaded
+
+== How It Works
+
+When {product-name} starts up, it compares the type dictionary in the storage (which describes the structure of previously stored types) with the current class definitions on the classpath.
+If differences are detected, Legacy Type Mapping activates for those types.
+
+The mapping process for each changed type:
+
+1. *Analysis* — the system compares the old type structure with the current type structure
+2. *Matching* — fields are matched between old and new using a combination of explicit mappings and heuristic analysis
+3. *Confirmation* — depending on configuration, the mapping may be confirmed automatically or presented for user review
+4. *Translation* — value translator functions are compiled for the matched fields
+5. *Loading* — when an instance of the legacy type is loaded, the translators convert the binary data to the new structure
+
+The analysis and compilation steps happen once during initialization.
+After that, loading legacy records is as fast as loading current records.
+
+== Supported Changes
+
+Legacy Type Mapping handles the following types of structural changes:
+
+[options="header",cols="1,2,1"]
+|===
+|Change Type
+|Description
+|Handling
+
+|Field renamed
+|A field changes its name but keeps its type
+|Automatic (heuristic) or explicit mapping
+
+|Field added
+|A new field is introduced in the class
+|Automatic — initialized to default value (`null`, `0`, `false`)
+
+|Field removed
+|A field is deleted from the class
+|Automatic — stored values are discarded
+
+|Field reordered
+|Fields change their position in the class
+|Fully automatic
+
+|Field type changed (primitives)
+|A primitive field changes to another primitive type
+|Automatic conversion (e.g., `int` to `long`)
+
+|Field type changed (primitive ↔ wrapper)
+|A field changes between primitive and wrapper
+|Automatic conversion (`null` → `0` for wrapper→primitive)
+
+|Class renamed
+|The fully qualified class name changes
+|Explicit mapping required
+
+|Class moved to different package
+|Same as renamed
+|Explicit mapping required
+
+|Inheritance changed
+|Class hierarchy restructured
+|Explicit mapping with declaring class syntax
+|===
+
+== Automatic Mapping
+
+In the most common cases, no configuration is needed.
+The heuristic automatically detects which fields are new, removed, reordered, or renamed.
+
+=== Example: Renaming and Restructuring Fields
+
+[source, java, title="Contact.java (old version)"]
+----
+public class Contact
+{
+    String name     ;
+    String firstname;
+    int    age      ;
+    String email    ;
+    String note     ;
+    Object link     ;
+}
+----
+
+[source, java, title="Contact.java (new version)"]
+----
+public class Contact
+{
+    String        firstname    ; // moved
+    String        lastname     ; // renamed from 'name'
+    String        emailAddress ; // renamed from 'email'
+    String        supportNote  ; // renamed from 'note'
+    PostalAddress postalAddress; // new field
+    int           age          ; // moved
+}
+----
+
+When the storage starts with the new class, the heuristic produces this mapping:
+
+[source, text, title="Console output"]
+----
+Legacy type mapping required for legacy type
+1000055:Contact
+to current type
+1000056:Contact
+Fields:
+java.lang.String Contact#firstname -1.000 ----> java.lang.String Contact#firstname
+java.lang.String Contact#name      -0.750 ----> java.lang.String Contact#lastname
+java.lang.String Contact#email     -0.708 ----> java.lang.String Contact#emailAddress
+java.lang.String Contact#note      -0.636 ----> java.lang.String Contact#supportNote
+[***new***] PostalAddress Contact#postalAddress
+int Contact#age                    -1.000 ----> int Contact#age
+java.lang.Object Contact#link [discarded]
+----
+
+The number between the old and new field names is the similarity score (1.0 = exact match).
+The heuristic uses Levenshtein distance to find the best match among fields of compatible types.
+
+In this example, the heuristic correctly:
+
+* Matched `firstname` → `firstname` (exact match, score 1.0)
+* Matched `name` → `lastname` (high similarity, score 0.75)
+* Matched `email` → `emailAddress` (good similarity, score 0.708)
+* Matched `note` → `supportNote` (reasonable similarity, score 0.636)
+* Identified `postalAddress` as new
+* Identified `age` as moved (exact match)
+* Discarded `link` (no compatible match found)
+
+=== When Heuristics Fail
+
+The heuristic makes educated guesses based on name similarity and type compatibility.
+It works well in most cases, but can fail when:
+
+* A field is renamed to something completely different (e.g., `customerid` → `pin`)
+* Two old fields are similarly named to two new fields, causing crossed assignments
+* A field is both renamed and retyped
+
+In these cases, use <<explicit-mapping,explicit mapping>> to guide the system.
+
+== Configuring the Mapping Callback
+
+The mapping behavior is controlled by the `PersistenceLegacyTypeMappingResultor`.
+By default, a `LoggingLegacyTypeMappingResultor` is used, which accepts all heuristic mappings and logs detected mappings via SLF4J.
+To observe the mapping process during development, configure your SLF4J logging level for `LoggingLegacyTypeMappingResultor` accordingly.
+
+You can provide a custom resultor through the storage foundation.
+See xref:legacy-type-mapping/user-interaction.adoc[User Interaction] for details.
+
+[#explicit-mapping]
+== Explicit Mapping
+
+When the heuristic cannot correctly map fields — or when you want deterministic, repeatable mappings — use explicit mapping via a CSV file.
+
+=== Setting Up
+
+[source, java]
+----
+EmbeddedStorageFoundation<?> foundation = EmbeddedStorage.Foundation(dataDir);
+foundation.setRefactoringMappingProvider(
+    Persistence.RefactoringMapping(Paths.get("refactorings.csv"))
+);
+EmbeddedStorageManager storage =
+    foundation.createEmbeddedStorageManager(root).start();
+----
+
+=== CSV Format
+
+The CSV file uses semicolons or tabs as separators, with two columns: `old` and `current`.
+
+[source, text, title="refactorings.csv"]
+----
+old                                             current
+com.myapp.entities.OldContact#customerid        com.myapp.entities.NewContact#pin
+com.myapp.entities.OldContact#comment
+----
+
+The three mapping operations:
+
+[options="header",cols="1,2,2"]
+|===
+|Operation
+|Syntax
+|Meaning
+
+|*Map* (rename)
+|`old_thing;new_thing`
+|The old element corresponds to the new element
+
+|*Delete* (discard)
+|`old_thing;`
+|The old element should be ignored (its data is discarded)
+
+|*Add* (new)
+|`;new_thing`
+|The new element has no predecessor (prevents heuristic from matching it to something else)
+|===
+
+You can mix explicit mappings with heuristic matching.
+Only specify the entries that the heuristic would get wrong — the system handles the rest automatically.
+
+=== Mapping Fields
+
+Fields are referenced using the `Class#field` syntax:
+
+[source, text]
+----
+com.myapp.entities.Order#count;com.myapp.entities.Order#articleCount
+----
+
+=== Mapping Classes (Renaming / Moving)
+
+Classes are referenced by their fully qualified name:
+
+[source, text]
+----
+com.myapp.entities.OldOrder;com.myapp.entities.Order
+----
+
+When a class is renamed, you do not need to also map each field individually — as long as the heuristic can match the fields correctly.
+Only add field mappings for fields that the heuristic would mis-assign.
+
+=== Mapping Fields with Inheritance
+
+If a class hierarchy is involved and multiple classes define a field with the same name, use the declaring class syntax to disambiguate:
+
+[source, text]
+----
+com.myapp.entities.Order#com.myapp.entities.ArticleHolder#count;com.myapp.entities.Order#com.myapp.entities.ArticleHolder#articleCount
+----
+
+The format is: `OwningClass#DeclaringClass#fieldName`.
+
+=== Mapping with Type IDs
+
+When multiple versions of the same class exist in the storage, you may need to specify the exact version using its Type ID:
+
+[source, text]
+----
+1012345:com.myapp.entities.Order;com.myapp.entities.Order
+----
+
+The Type ID can be found in the TypeDictionary file in the storage directory.
+
+=== Comprehensive Example
+
+Consider this refactoring scenario:
+
+[source, java, title="Old version"]
+----
+package com.myapp.entities;
+
+public class Customer
+{
+    int    customerid;   // will be renamed to 'pin' and changed to Integer
+    String firstname;    // will be renamed to 'firstName' (case change)
+    String surname;      // will be renamed to 'lastName'
+    String comment;      // will be removed
+}
+----
+
+[source, java, title="New version"]
+----
+package com.myapp.entities;
+
+public class Customer
+{
+    Integer pin;         // renamed from 'customerid', type changed
+    String  firstName;   // renamed from 'firstname'
+    String  lastName;    // renamed from 'surname'
+    String  commerceId;  // new field (NOT from 'comment')
+    Address address;     // new field
+}
+----
+
+Without explicit mapping, the heuristic would produce:
+
+[source, text]
+----
+             [***new***] pin
+firstname    -0.944 ----> firstName
+surname      -0.688 ----> lastName
+comment      -0.750 ----> commerceId    <-- WRONG! comment is not commerceId
+             [***new***] address
+customerid   [discarded]                <-- WRONG! should map to pin
+----
+
+The heuristic incorrectly discards `customerid` (too dissimilar to `pin`) and incorrectly maps `comment` to `commerceId` (0.75 similarity).
+
+Fix with explicit mapping:
+
+[source, text, title="refactorings.csv"]
+----
+old                                        current
+com.myapp.entities.Customer#customerid     com.myapp.entities.Customer#pin
+com.myapp.entities.Customer#comment
+----
+
+Two entries are sufficient:
+
+* Map `customerid` → `pin` explicitly
+* Mark `comment` as discarded
+
+The heuristic handles the rest:
+
+[source, text]
+----
+customerid   -[mapped] -> pin
+firstname    -0.944 ----> firstName
+surname      -0.688 ----> lastName
+             [***new***] commerceId
+             [***new***] address
+comment      [discarded]
+----
+
+== Value Conversion
+
+When fields are matched, the values need to be converted from the old binary representation to the new one.
+
+=== Primitive to Primitive
+
+All conversions between Java primitive types are handled automatically.
+The `BinaryValueTranslators` class provides converter functions for every combination:
+
+[options="header",cols="1,1"]
+|===
+|Conversion
+|Behavior
+
+|`int` → `long`
+|Widening conversion (lossless)
+
+|`long` → `int`
+|Narrowing conversion (possible data loss, like a Java cast)
+
+|`int` → `float`
+|Standard Java cast semantics
+
+|`int` → `double`
+|Widening conversion (lossless)
+
+|`boolean` → `int`
+|`false` = 0, `true` = 1
+
+|Any other primitive pair
+|Standard Java cast semantics
+|===
+
+[source, java, title="Example: Field type changes from int to long"]
+----
+// Old version
+public class Product
+{
+    int quantity;
+}
+
+// New version
+public class Product
+{
+    long quantity; // widened from int
+}
+----
+
+This is handled automatically — no mapping configuration needed.
+
+=== Primitive ↔ Wrapper Conversion
+
+Conversions between primitives and their wrapper types are handled automatically:
+
+[options="header",cols="1,1"]
+|===
+|Conversion
+|Behavior
+
+|`int` → `Integer`
+|Automatic boxing
+
+|`Integer` → `int`
+|Automatic unboxing (`null` converts to `0`)
+
+|`boolean` → `Boolean`
+|Automatic boxing
+
+|`Double` → `double`
+|Automatic unboxing (`null` converts to `0.0`)
+|===
+
+[source, java, title="Example: Primitive to wrapper"]
+----
+// Old version
+public class Customer
+{
+    int    customerid;
+    double balance;
+}
+
+// New version
+public class Customer
+{
+    Integer customerid; // boxed: int → Integer
+    Double  balance;    // boxed: double → Double
+}
+----
+
+== Custom Legacy Type Handlers
+
+For complex migrations that cannot be expressed through field mapping alone — such as splitting one field into multiple, computing derived values, or restructuring nested objects — implement a custom legacy type handler.
+
+A custom legacy type handler gives you full control over how old binary data is read and converted into new object instances.
+
+=== Example: Splitting a Field
+
+Consider a type where a single `directions` field is replaced by a structured `Location` object:
+
+[source, java, title="NicePlace.java (old version stored in database)"]
+----
+public class NicePlace
+{
+    String name;
+    String directions; // e.g., "Turn left at Main St, 48.137, 11.576"
+}
+----
+
+[source, java, title="NicePlace.java (new version)"]
+----
+public class NicePlace
+{
+    String   name;
+    Location location; // structured replacement for 'directions'
+}
+
+public class Location
+{
+    String directions;
+    double latitude;
+    double longitude;
+}
+----
+
+[source, java, title="LegacyTypeHandlerNicePlace.java"]
+----
+public class LegacyTypeHandlerNicePlace
+    extends BinaryLegacyTypeHandler.AbstractCustom<NicePlace>
+{
+    // Binary layout of the OLD type (two String references)
+    private static final long
+        BINARY_OFFSET_name       = 0,
+        BINARY_OFFSET_directions = BINARY_OFFSET_name
+            + Binary.objectIdByteLength();
+
+    public LegacyTypeHandlerNicePlace()
+    {
+        // Define the OLD field structure
+        super(
+            NicePlace.class,
+            X.List(
+                CustomField(String.class, "name"),
+                CustomField(String.class, "directions")
+            )
+        );
+    }
+
+    @Override
+    public NicePlace create(
+        final Binary bytes,
+        final PersistenceLoadHandler loadHandler
+    )
+    {
+        return new NicePlace();
+    }
+
+    @Override
+    public void updateState(
+        final Binary bytes,
+        final NicePlace instance,
+        final PersistenceLoadHandler handler
+    )
+    {
+        // Read the OLD fields from binary
+        final String name = (String) handler.lookupObject(
+            bytes.read_long(BINARY_OFFSET_name));
+        final String directions = (String) handler.lookupObject(
+            bytes.read_long(BINARY_OFFSET_directions));
+
+        // Map to the NEW structure
+        instance.name = name;
+        instance.location = new Location(directions, 0.0, 0.0);
+    }
+
+    @Override
+    public void iterateLoadableReferences(
+        final Binary bytes,
+        final PersistenceReferenceLoader iterator
+    )
+    {
+        // Tell the loader about all object references in the OLD binary
+        iterator.acceptObjectId(bytes.read_long(BINARY_OFFSET_name));
+        iterator.acceptObjectId(bytes.read_long(BINARY_OFFSET_directions));
+    }
+
+    @Override
+    public boolean hasPersistedReferences()
+    {
+        return true; // This type contains object references
+    }
+
+    @Override
+    public boolean hasVaryingPersistedLengthInstances()
+    {
+        return false; // Fixed binary layout
+    }
+}
+----
+
+=== Registering the Handler
+
+[source, java]
+----
+EmbeddedStorageManager storage = EmbeddedStorage.Foundation(dataDir)
+    .onConnectionFoundation(f ->
+        f.getCustomTypeHandlerRegistry()
+            .registerLegacyTypeHandler(new LegacyTypeHandlerNicePlace())
+    )
+    .start();
+----
+
+NOTE: See the full example at https://github.com/eclipse-store/store/tree/master/examples/custom-legacy-type-handler[custom-legacy-type-handler on GitHub].
+
+== Special Case: Deleted Class
+
+You cannot simply delete a Java class if records of that type still exist in the storage.
+During initialization, {product-name} scans all storage files and ensures a type handler exists for every Type ID encountered.
+
+However, if all instances of a type are logically unreachable (no references from the object graph point to them), the class can be marked as deleted in the refactoring mapping:
+
+[source, text, title="refactorings.csv"]
+----
+old                               current
+com.myapp.entities.ObsoleteType
+----
+
+This creates a `PersistenceUnreachableTypeHandler` that does not require the class to exist on the classpath.
+
+[WARNING]
+====
+If you are wrong and an instance of the "deleted" type is still referenced somewhere in the object graph, the unreachable type handler will throw an exception at runtime when that instance is loaded.
+
+To verify safely:
+
+1. Run the xref:housekeeping.adoc[housekeeping] cleanup to remove all unreachable records from storage files
+2. Restart the storage — if no error occurs, the class is truly unreachable and can be safely deleted
+====
+
+== Customizing the Heuristic
+
+The default heuristic uses Levenshtein distance to score field name similarity.
+You can replace it with your own implementation of `PersistenceMemberSimilator`:
+
+[source, java]
+----
+foundation.onConnectionFoundation(f ->
+    f.setLegacyMemberMatchingProvider(
+        // Your custom PersistenceMemberSimilator implementation
+    )
+);
+----
+
+Use cases for custom heuristics:
+
+* Annotation-based matching (e.g., `@MappedFrom("oldName")`)
+* Domain-specific naming conventions
+* Stricter or more lenient matching thresholds
+
+== Performance
+
+* *Initialization* — type analysis, field matching, and translator compilation happen once during startup
+* *Loading* — legacy records load at the same speed as current records for reflection-based types (the translator array is different in order and offsets, but the principle is the same)
+* *Custom handlers* — require an intermediate binary reorganization step before the handler reads the data, which adds minimal overhead
+* *Storage* — when a legacy record is loaded, modified, and stored again, it is written in the current format. Over time, all legacy records are naturally migrated
+
+== Quick Reference
+
+=== Minimal Setup (Automatic Mapping)
+
+[source, java]
+----
+// Just start — heuristic handles everything
+EmbeddedStorageManager storage = EmbeddedStorage.start(root, dataDir);
+----
+
+=== With Explicit Mapping File
+
+[source, java]
+----
+EmbeddedStorageFoundation<?> foundation = EmbeddedStorage.Foundation(dataDir);
+foundation.setRefactoringMappingProvider(
+    Persistence.RefactoringMapping(Paths.get("refactorings.csv"))
+);
+EmbeddedStorageManager storage =
+    foundation.createEmbeddedStorageManager(root).start();
+----
+
+=== With Custom Legacy Type Handler
+
+[source, java]
+----
+EmbeddedStorageManager storage = EmbeddedStorage.Foundation(dataDir)
+    .onConnectionFoundation(f ->
+        f.getCustomTypeHandlerRegistry()
+            .registerLegacyTypeHandler(new MyLegacyTypeHandler())
+    )
+    .start();
+----

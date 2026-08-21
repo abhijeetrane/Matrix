@@ -1,0 +1,33 @@
+#ifndef __XEN_VERSION_H__
+#define __XEN_VERSION_H__
+
+#include <xen/elfstructs.h>
+
+const char *xen_compile_date(void);
+const char *xen_compile_time(void);
+const char *xen_compile_by(void);
+const char *xen_compile_domain(void);
+const char *xen_compile_host(void);
+const char *xen_compiler(void);
+unsigned int xen_major_version(void);
+unsigned int xen_minor_version(void);
+const char *xen_extra_version(void);
+const char *xen_changeset(void);
+const char *xen_banner(void);
+const char *xen_deny(void);
+const char *xen_build_info(void);
+
+extern char xen_cap_info[128];
+
+extern const void *xen_build_id;
+extern unsigned int xen_build_id_len; /* 0 -> No build id. */
+
+#ifdef BUILD_ID
+void xen_build_init(void);
+int xen_build_id_check(const Elf_Note *n, unsigned int n_sz,
+                       const void **p, unsigned int *len);
+#else
+static inline void xen_build_init(void) {};
+#endif
+
+#endif /* __XEN_VERSION_H__ */

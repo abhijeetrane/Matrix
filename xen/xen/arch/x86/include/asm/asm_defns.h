@@ -1,0 +1,321 @@
+
+#ifndef __X86_ASM_DEFNS_H__
+#define __X86_ASM_DEFNS_H__
+
+#ifndef COMPILE_OFFSETS
+/* NB. Auto-generated from arch/.../asm-offsets.c */
+#include <asm/asm-offsets.h>
+#endif
+#include <asm/x86-defns.h>
+#include <xen/bug.h>
+#include <xen/stringify.h>
+#include <asm/cpufeature.h>
+#include <asm/alternative.h>
+
+#ifdef __ASSEMBLER__
+#include <xen/linkage.h>
+#include <asm/asm-defns.h>
+#ifndef CONFIG_INDIRECT_THUNK
+.equ CONFIG_INDIRECT_THUNK, 0
+#endif
+#else
+#include <asm/asm-macros.h>
+asm ( "\t.equ CONFIG_INDIRECT_THUNK, "
+      __stringify(IS_ENABLED(CONFIG_INDIRECT_THUNK)) );
+#endif
+
+#ifndef __ASSEMBLER__
+
+/*
+ * This output constraint should be used for any inline asm which has a "call"
+ * instruction, which forces the frame pointer to be set up prior to the asm
+ * block.  This matters when unwinding using frame pointers, where the asm's
+ * function can get skipped over.
+ */
+#ifdef CONFIG_FRAME_POINTER
+register unsigned long current_stack_pointer asm("rsp");
+# define ASM_CALL_CONSTRAINT , "+r" (current_stack_pointer)
+#else
+# define ASM_CALL_CONSTRAINT
+#endif
+
+#endif
+
+#ifndef NDEBUG
+#define ASSERT_INTERRUPT_STATUS(x, msg)         \
+        pushf;                                  \
+        testb $X86_EFLAGS_IF>>8,1(%rsp);        \
+        j##x  1f;                               \
+        ASSERT_FAILED(msg);                     \
+1:      addq  $8,%rsp;
+#else
+#define ASSERT_INTERRUPT_STATUS(x, msg)
+#endif
+
+#define ASSERT_INTERRUPTS_ENABLED \
+    ASSERT_INTERRUPT_STATUS(nz, "INTERRUPTS ENABLED")
+#define ASSERT_INTERRUPTS_DISABLED \
+    ASSERT_INTERRUPT_STATUS(z, "INTERRUPTS DISABLED")
+
+#ifdef __ASSEMBLER__
+# define _ASM_EX(p) p-.
+#else
+# define _ASM_EX(p) #p "-."
+#endif
+
+/* Exception table entry */
+#ifdef __ASSEMBLER__
+# define _ASM_EXTABLE(from, to)                   \
+    .section .ex_table, "a" ;                     \
+    .balign 4 ;                                   \
+    .long _ASM_EX(from), _ASM_EX(to) ;            \
+    .previous
+#else
+# define _ASM_EXTABLE(from, to)                   \
+    " .section .ex_table,\"a\"\n"                 \
+    " .balign 4\n"                                \
+    " .long " _ASM_EX(from) ", " _ASM_EX(to) "\n" \
+    " .previous\n"
+#endif
+
+#ifdef __ASSEMBLER__
+
+.macro BUILD_BUG_ON condstr, cond:vararg
+        .if \cond
+        .error "Condition \"\condstr\" not satisfied"
+        .endif
+.endm
+/* preprocessor macro to make error message more user friendly */
+#define BUILD_BUG_ON(cond) BUILD_BUG_ON #cond, cond
+
+#ifdef HAVE_AS_QUOTED_SYM
+#define SUBSECTION_LBL(tag)                        \
+        .ifndef .L.tag;                            \
+        .equ .L.tag, 1;                            \
+        .equ __stringify(__OBJECT_LABEL__.tag), .; \
+        .endif
+#else
+#define SUBSECTION_LBL(tag)                        \
+        .ifndef __OBJECT_LABEL__.tag;              \
+        __OBJECT_LABEL__.tag:;                     \
+        .endif
+#endif
+
+#define UNLIKELY_START(cond, tag) \
+        .Ldispatch.tag:           \
+        j##cond .Lunlikely.tag;   \
+        .subsection 1;            \
+        SUBSECTION_LBL(unlikely); \
+        .Lunlikely.tag:
+
+#define UNLIKELY_DISPATCH_LABEL(tag) \
+        .Ldispatch.tag
+
+#define UNLIKELY_DONE(cond, tag)  \
+        j##cond .Llikely.tag
+
+#define __UNLIKELY_END(tag)       \
+        .subsection 0;            \
+        .Llikely.tag:
+
+#define UNLIKELY_END(tag)         \
+        UNLIKELY_DONE(mp, tag);   \
+        __UNLIKELY_END(tag)
+
+        .equ .Lrax, 0
+        .equ .Lrcx, 1
+        .equ .Lrdx, 2
+        .equ .Lrbx, 3
+        .equ .Lrsp, 4
+        .equ .Lrbp, 5
+        .equ .Lrsi, 6
+        .equ .Lrdi, 7
+        .equ .Lr8,  8
+        .equ .Lr9,  9
+        .equ .Lr10, 10
+        .equ .Lr11, 11
+        .equ .Lr12, 12
+        .equ .Lr13, 13
+        .equ .Lr14, 14
+        .equ .Lr15, 15
+
+#define STACK_CPUINFO_FIELD(field) (1 - CPUINFO_sizeof + CPUINFO_##field)
+#define GET_STACK_END(reg)                        \
+        .if .Lr##reg >= 8;                        \
+        movl $STACK_SIZE-1, %r##reg##d;           \
+        .else;                                    \
+        movl $STACK_SIZE-1, %e##reg;              \
+        .endif;                                   \
+        orq  %rsp, %r##reg
+
+#define GET_CPUINFO_FIELD(field, reg)             \
+        GET_STACK_END(reg);                       \
+        addq $STACK_CPUINFO_FIELD(field), %r##reg
+
+#define GET_CURRENT(reg)                          \
+        GET_STACK_END(reg);                       \
+        movq STACK_CPUINFO_FIELD(current_vcpu)(%r##reg), %r##reg
+
+#ifndef NDEBUG
+#define ASSERT_NOT_IN_ATOMIC                                             \
+    sti; /* sometimes called with interrupts disabled: safe to enable */ \
+    call ASSERT_NOT_IN_ATOMIC
+#else
+#define ASSERT_NOT_IN_ATOMIC
+#endif
+
+#define CPUINFO_FEATURE_OFFSET(feature)           \
+    (CPUINFO_features + (cpufeat_word(feature) * 4))
+
+#else
+
+#ifdef HAVE_AS_QUOTED_SYM
+#define SUBSECTION_LBL(tag)                                          \
+        ".ifndef .L." #tag "\n\t"                                    \
+        ".equ .L." #tag ", 1\n\t"                                    \
+        ".equ \"" __stringify(__OBJECT_LABEL__) "." #tag "\", .\n\t" \
+        ".endif"
+#else
+#define SUBSECTION_LBL(tag)                                          \
+        ".ifndef " __stringify(__OBJECT_LABEL__) "." #tag "\n\t"     \
+        __stringify(__OBJECT_LABEL__) "." #tag ":\n\t"               \
+        ".endif"
+#endif
+
+#ifdef __clang__ /* clang's builtin assember can't do .subsection */
+
+#define UNLIKELY_START_SECTION ".pushsection .text.unlikely,\"ax\""
+#define UNLIKELY_END_SECTION   ".popsection"
+
+#else
+
+#define UNLIKELY_START_SECTION ".subsection 1"
+#define UNLIKELY_END_SECTION   ".subsection 0"
+
+#endif
+
+#define UNLIKELY_START(cond, tag)                   \
+        "j" #cond " .Lunlikely." #tag ".%=;\n\t"   \
+        UNLIKELY_START_SECTION "\n\t"               \
+        SUBSECTION_LBL(unlikely) "\n"               \
+        ".Lunlikely." #tag ".%=:"
+
+#define UNLIKELY_END(tag)                  \
+        "jmp .Llikely." #tag ".%=;\n\t"    \
+        UNLIKELY_END_SECTION "\n"          \
+        ".Llikely." #tag ".%=:"
+
+static always_inline void clac(void)
+{
+    /* Note: a barrier is implicit in alternative() */
+    alternative("", "clac", X86_FEATURE_XEN_SMAP);
+}
+
+static always_inline void stac(void)
+{
+    /* Note: a barrier is implicit in alternative() */
+    alternative("", "stac", X86_FEATURE_XEN_SMAP);
+}
+#endif
+
+#ifdef __ASSEMBLER__
+/*
+ * Push and clear GPRs
+ */
+.macro PUSH_AND_CLEAR_GPRS
+        push  %rdi
+        xor   %edi, %edi
+        push  %rsi
+        xor   %esi, %esi
+        push  %rdx
+        xor   %edx, %edx
+        push  %rcx
+        xor   %ecx, %ecx
+        push  %rax
+        xor   %eax, %eax
+        push  %r8
+        xor   %r8d, %r8d
+        push  %r9
+        xor   %r9d, %r9d
+        push  %r10
+        xor   %r10d, %r10d
+        push  %r11
+        xor   %r11d, %r11d
+        push  %rbx
+        xor   %ebx, %ebx
+        push  %rbp
+#ifdef CONFIG_FRAME_POINTER
+/* Indicate special exception stack frame by inverting the frame pointer. */
+        mov   %rsp, %rbp
+        not   %rbp
+#else
+        xor   %ebp, %ebp
+#endif
+        push  %r12
+        xor   %r12d, %r12d
+        push  %r13
+        xor   %r13d, %r13d
+        push  %r14
+        xor   %r14d, %r14d
+        push  %r15
+        xor   %r15d, %r15d
+.endm
+
+/*
+ * POP GPRs from a UREGS_* frame on the stack.  Does not modify flags.
+ */
+.macro POP_GPRS skip_rax=0
+        pop   %r15
+        pop   %r14
+        pop   %r13
+        pop   %r12
+        pop   %rbp
+        pop   %rbx
+        pop   %r11
+        pop   %r10
+        pop   %r9
+        pop   %r8
+ .if \skip_rax
+        pop   %rcx /* Any register yet to restore. */
+ .else
+        pop   %rax
+ .endif
+        pop   %rcx
+        pop   %rdx
+        pop   %rsi
+        pop   %rdi
+.endm
+
+#ifdef CONFIG_PV32
+#define CR4_PV32_RESTORE                               \
+    ALTERNATIVE_2 "",                                  \
+        "call cr4_pv32_restore", X86_FEATURE_XEN_SMEP, \
+        "call cr4_pv32_restore", X86_FEATURE_XEN_SMAP
+#else
+#define CR4_PV32_RESTORE
+#endif
+
+#include <asm/spec_ctrl_asm.h>
+
+#endif
+
+/* Work around AMD erratum #88 */
+#define safe_swapgs                             \
+        "mfence; swapgs;"
+
+#define ELFNOTE(name, type, desc)           \
+    .pushsection .note.name, "a", @note   ; \
+    .p2align 2                            ; \
+    .long 2f - 1f       /* namesz */      ; \
+    .long 4f - 3f       /* descsz */      ; \
+    .long type          /* type   */      ; \
+1:  .asciz #name        /* name   */      ; \
+2:  .p2align 2                            ; \
+3:  desc                /* desc   */      ; \
+4:  .p2align 2                            ; \
+    .popsection
+
+#define ASM_CONSTANT(name, value)                \
+    asm ( ".equ " #name ", %P0; .global " #name  \
+          :: "i" ((value)) );
+#endif /* __X86_ASM_DEFNS_H__ */

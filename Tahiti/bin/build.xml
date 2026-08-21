@@ -1,0 +1,107 @@
+<?xml version="1.0"?>
+
+<!--
+
+Ant script for VISTA by Team Tahiti
+
+Revision history:
+04/07/2005 Modified to generate javadoc for test package.
+           No need to add properties, etc. for test
+           package since Java dependencies handles this.
+           
+03/02/2005 Initial version
+
+-->
+
+<project name="vista" default="compile" basedir=".">
+     <!-- These are properties used by the script. -->
+
+     <property name="src" value="vista" />
+
+     <property name="src.object" value="vista/object"/>
+
+     <property name="src.tuples" value="vista/tuples"/>
+
+     <property name="src.util" value="vista/util"/>
+
+     <property name="src.ui" value="vista/ui"/>
+
+     <property name="build.classes" value="build"/>
+
+     <property name="html" value="html"/>
+
+     <!-- This tasks makes the build and html directories. -->
+     <target name="prepare" description="make needed directories">
+       <mkdir dir="${build.classes}"/>
+       <mkdir dir="${html}"/>
+     </target>
+
+     <!-- This task cleans up the build and html directories. -->
+     <target name="clean" description="clean up build and html directories">
+       <delete dir="${build.classes}"/>   
+       <delete dir="${html}"/>
+       </target>
+
+     <!-- This task creates the base vista classes, it depends
+          on having the build directory being created. -->
+     <target name="vista" description="base classes" depends="prepare">
+          <javac srcdir="${src}" destdir="${build.classes}"/>
+     </target>
+
+     <!-- This task builds the object classes, it depends on the base
+          vista classes. -->
+     <target name="object" description="object classes" depends="vista">
+          <javac srcdir="${src.object}" destdir="${build.classes}" classpath="${build.classes}"/>
+     </target>
+
+     <!-- This task builds the tuples classes, it depends on the base
+          vista classes and object classes. -->
+     <target name="tuples" description="tuples classes" depends="vista,object,util">
+          <javac srcdir="${src.tuples}" destdir="${build.classes}" classpath="${build.classes}"/>
+     </target>
+
+     <!-- This task builds the utility classes, it depends on the base
+          vista classes. -->
+     <target name="util" description="util classes" depends="vista">
+          <javac srcdir="${src.util}" destdir="${build.classes}" classpath="${build.classes}"/>
+     </target>
+
+     <!-- This task builds the UI classes, it depends on the base
+          vista classes. -->
+     <target name="ui" description="ui classes" depends="vista,object,tuples,util">
+          <javac srcdir="${src.ui}" destdir="${build.classes}" classpath="${build.classes}"/>
+     </target>
+
+     <!-- This task builds the executable jar, it depends the UI
+          being built.
+	  (currently, this has no manifest, so it will not be executable.)
+	  -->
+     <target name="compile" description="VISTA jar" depends="ui">
+       <!--   <jar jarfile="${build.classes}/vista.jar"
+               basedir="${build.classes}"
+               includes="**/*.class" />
+         -->
+              <jar jarfile="${build.classes}/vista.jar"
+               manifest="vista.manifest"
+               basedir="${build.classes}"
+               includes="**/*.class" 
+               />
+               
+
+     </target>
+
+     <!-- This task builds the javadoc. The task is not on any dependency
+          path (by design) since the docs may or may not need to be created. -->
+     <target name="docs" description="javadoc">
+
+          <javadoc destdir="${html}" windowtitle="VISTA Design Pattern">
+            <package name="vista"/>
+            <package name="vista.object"/>
+            <package name="vista.tuples"/>
+            <package name="vista.util"/>
+            <package name="vista.ui"/>
+            <package name="vista.test"/>
+            <sourcepath location="."/>
+           </javadoc>
+     </target>
+</project>

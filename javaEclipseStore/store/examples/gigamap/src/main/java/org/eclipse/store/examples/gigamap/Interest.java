@@ -1,0 +1,42 @@
+package org.eclipse.store.examples.gigamap;
+
+/*-
+ * #%L
+ * EclipseStore Example GigaMap
+ * %%
+ * Copyright (C) 2023 - 2025 MicroStream Software
+ * %%
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ * 
+ * SPDX-License-Identifier: EPL-2.0
+ * #L%
+ */
+
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import net.datafaker.service.RandomService;
+
+public enum Interest
+{
+	SPORTS,
+	LITERATURE,
+	PARTY,
+	CHARITY;
+	
+	
+	static List<Interest> random(final RandomService random)
+	{
+		final Interest[] values = Interest.values();
+		final int count = random.nextInt(1, values.length);
+		return IntStream.rangeClosed(0, count)
+			.map(i -> random.nextInt(count))
+			.mapToObj(i -> values[i])
+			.distinct()
+			.collect(Collectors.toList())
+		;
+	}
+}

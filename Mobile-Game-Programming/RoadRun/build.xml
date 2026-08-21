@@ -1,0 +1,114 @@
+<!--
+
+This Ant script is for building RoadRun using Antenna.
+
+You'll need to change the following property settings for your
+environment:
+
+  1) midp.home
+  2) wtk.home
+  
+Find these properties below and change them.  
+  
+Place this file in the directory that contains the directory, RoadRun.
+That is, if the .java source is a c:\ch7\RoadRun, this file goes in
+c:\ch7.
+
+1) To compile on Windows, run
+   ant.bat -buildfile roadrun.xml
+
+2) To run on Windows, first do step #1 above, then run
+   ant.bat -buildfile roadrun.xml run
+
+Revision history:
+26 Sep 05 RC Added ability to run midlet, javadoc, and change skin.
+22 Sep 05 RC Added ability to write jad file for midlet suites.
+21 Sep 05 RC Updated to invoke MIDP 2.0.
+22 Aug 05 RC Completed first version.
+
+-->
+
+<project name="RoadRun" default="compile" basedir=".">  
+   <target name="init" depends="setup">
+   
+     <!-- CHANGE THIS PROPERTY -->   
+     <property name="midp.home" value="c:\midp2.0fcs"/>
+     
+     <!-- CHANGE THIS PROPERTY -->     
+     <property name="wtk.home" value="c:\WTK22"/>
+
+     <!-- OPTIONAL PROPERTY. Alternate values in WTK User's Guide, Ch 4. -->        
+     <property name="midlet.skin" value="MediaControlSkin"/>
+     
+     <!-- DO NOT CHANGE ANYTHING BELOW THIS LINE -->
+     
+     <property name="game" value="RoadRun"/>
+     <property name="wtk.midp.version" value="2.0"/>
+     <property name="midlet.name" value="${game}"/>
+     <property name="suite.name" value="${midlet.name}"/>
+     <property name="invoke.name" value="${midlet.name}"/>
+     <property name="bd" value="build"/>
+     <property name="docs" value="html"/>     
+       
+   </target>
+
+   <target name="compile" depends="init">
+     <property name="midlet.name" value="${game}"/>
+
+     <delete dir="${bd}"/>
+     <delete dir="${docs}"/>
+     <mkdir dir="${bd}"/>
+     
+     <javac destdir="${bd}" srcdir="${midlet.name}"
+       bootclasspath="${midp.home}/classes;${bd}" debug="true"/>
+     
+     <!-- Create a jad file from scratch -->
+     <wtkjad jadfile="${bd}/${midlet.name}.jad"
+            jarfile="${bd}/${midlet.name}.jar"
+            name="${suite.name}" vendor="GDP I" version="1.0">
+            
+            <!-- Create the suite item with name, class to run but no icon -->
+            <midlet name="${midlet.name}" class="${invoke.name}"/>
+     </wtkjad>
+     
+     <!-- Preverify the jar and update the jad (which must already exist). -->
+     <wtkpackage jarfile="${bd}/${midlet.name}.jar"
+                 jadfile="${bd}/${midlet.name}.jad"
+                 preverify="true">
+                 
+                <fileset dir="${bd}" />
+     </wtkpackage>
+     
+   </target>
+
+   <!-- Execute the jad. Do this target only after compiling successfully. -->
+   <target name="run" depends="init">
+    
+     <wtkrun jadfile="${bd}/${midlet.name}.jad" device="${midlet.skin}" />
+     
+   </target>
+
+   <!-- Make javadoc html files. -->
+   <target name="docs" depends="init">
+     <javadoc destdir="${docs}" windowtitle="RoadRun 2.0">     
+       <fileset dir="${midlet.name}">
+         <include name="**/*.java"/>
+       </fileset>
+       
+     </javadoc>
+   </target>
+
+  <!-- ........................... Antenna Setup ....................... -->
+  <target name="setup">
+    <!-- Antenna Setup -->
+    <taskdef name="wtkjad" classname="de.pleumann.antenna.WtkJad"/>
+    <taskdef name="wtkbuild" classname="de.pleumann.antenna.WtkBuild"/>
+    <taskdef name="wtkpackage" classname="de.pleumann.antenna.WtkPackage"/>
+    <taskdef name="wtkmakeprc" classname="de.pleumann.antenna.WtkMakePrc"/>
+    <taskdef name="wtkrun" classname="de.pleumann.antenna.WtkRun"/>
+    <taskdef name="wtkpreverify" classname="de.pleumann.antenna.WtkPreverify"/>
+    <taskdef name="wtkobfuscate" classname="de.pleumann.antenna.WtkObfuscate"/>
+    <taskdef name="wtksmartlink" classname="de.pleumann.antenna.WtkSmartLink"/>
+    <taskdef name="wtkpreprocess" classname="de.pleumann.antenna.WtkPreprocess"/>
+  </target>
+</project>

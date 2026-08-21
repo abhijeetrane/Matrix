@@ -1,0 +1,64 @@
+= System Requirements
+
+== Supported JDKs
+
+Tested and officially supported JDKs:
+
+|===
+| JDK | Supported Versions
+
+| https://www.oracle.com/technetwork/java/javase/downloads/index.html[Oracle JDK]
+| 17, 21, 24
+
+| http://jdk.java.net/[OpenJDK Build by Oracle]
+| 17, 21, 24
+
+| https://adoptium.net/[Adoptium Temurin (HotSpot / OpenJ9)]
+| 17, 21, 24
+
+
+| https://aws.amazon.com/corretto/[Amazon Corretto]
+| 17, 21, 24
+
+| https://www.azul.com/downloads/zulu/[Azul Zulu]
+|17, 21, 24
+
+| https://bell-sw.com/pages/products[Bellsoft Liberica]
+|17, 21, 24
+
+| https://sap.github.io/SapMachine/[SapMachine]
+| 17, 21, 24
+
+
+| https://www.microsoft.com/openjdk/[MicroSoft OpenJDK]
+|17, 21
+
+| http://dragonwell-jdk.io/[Alibaba Dragonwell]
+|17, 21
+
+| https://developer.ibm.com/languages/java/semeru-runtimes/[IBM Semeru]
+|17, 21
+
+| https://www.graalvm.org/[GraalVM]
+| 20.0+
+
+| https://developer.android.com/studio/releases/platforms[Android SDK]
+| API level 34+
+
+If you want to use an earlier version, you have to enable core library desugaring.
+|===
+
+In theory {product-name} is compatible with all JDK distributions from Version 17 on.
+
+== Supported Operating Systems
+
+* Every desktop or server operating system that the supported JVMs are available for
+* Android 8+
+
+== Third Party Libraries
+
+{product-name}'s core itself doesn't have any dependencies to other libraries whatsoever.
+So you don't have to worry about potential conflicts in your environment.
+This was a matter of choice of ours to keep the life of the developers using {product-name} as simple as possible.
+On the other hand feel free to include any dependencies you need, {product-name} will play along well, e.g.
+a logging framework of your choice.

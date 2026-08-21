@@ -1,0 +1,19 @@
+= Communication
+
+{product-name} provides a module for simple object-based network communication over TCP connections.
+
+This module utilizes the Eclipse Serializer engine to serialize and deserialize Java objects and provides additional APIs to set up the required TCP connections.
+
+== Key Features
+
+* *Object-based communication* — send and receive Java objects directly, no manual serialization needed
+* *Dynamic type handling* — automatically register and map types at runtime
+* *TLS support* — encrypted communication with configurable TLS settings
+* *Simple API* — straightforward host/client architecture with channel-based communication
+
+== Topics
+
+* xref:communication:getting-started.adoc[Getting Started] — prerequisites, Hello World example
+* xref:communication:configuration.adoc[Configuration] — host/client setup, dynamic vs non-dynamic mode
+* xref:communication:tls.adoc[TLS] — securing communication with TLS encryption
+* xref:communication:error-handling.adoc[Error Handling and Reconnection] — handling connection failures

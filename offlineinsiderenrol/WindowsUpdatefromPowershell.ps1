@@ -1,0 +1,47 @@
+# SIG # Begin signature block
+# MIIFhQYJKoZIhvcNAQcCoIIFdjCCBXICAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
+# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUV5OKkscKPAIrHlf/lLooss+K
+# UuKgggMYMIIDFDCCAfygAwIBAgIQaPUl6nyNK6NC5uKFMJiy7DANBgkqhkiG9w0B
+# AQsFADAiMSAwHgYDVQQDDBdNeVBvd2VyU2hlbGxTaWduaW5nQ2VydDAeFw0yNjA4
+# MTgxNDEyMDVaFw0yNzA4MTgxNDMyMDVaMCIxIDAeBgNVBAMMF015UG93ZXJTaGVs
+# bFNpZ25pbmdDZXJ0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0myC
+# Y6ZC63baW98v3xIeg0hRhfxXrJ1r4ziv4IbhSji1sGvK4XViZrI5AMd9EZWFfcVz
+# Y7fXiseLfLJtd5L1MDZF9zh6T/p/QoizmLVPDKmWi1YlW0M4Rf5ESuQXRfl45Liy
+# /Zf/o8oHwLEjt5SUSm9yUpthXJMJbUt/Sw/Z3E1UkKza7IIUluRqWwb69IHrxISA
+# TSfwy0vZDvP915F3hsbGnHz/nT717Buw98k2wVooFMvHK/rTUex1jUuMNX4M/4+q
+# 8rvjs33shDJA8rfNO0Qpg5Icu2ac34buiyAilvNPHSmr2MhNiyH1bddO4OKzN5L+
+# mKkvWHdgYU6nALteCQIDAQABo0YwRDAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAww
+# CgYIKwYBBQUHAwMwHQYDVR0OBBYEFMNMcWRBUdNCprX9/vfVomf1n1pAMA0GCSqG
+# SIb3DQEBCwUAA4IBAQAWYeFNSxOffsBeUBCT3oiYwtAO+wgf+T84nuBuzzvqYQ+Z
+# BGKCmPdzzGgW8ARQLTu5qKFL72/ZaQPWgVZ1IumA6xLsAdtbCmUOih0wx9CzSx/n
+# U8dkZiINSjrISJSML5J65UiSLyL2dv10TlgjcsEZ+mhjnYk5tfYUlhO16pAuedYz
+# 5L6SDMjzbj9Q927SvRsZ+xxYKnXHQDyovdoy+ibrEOQiFp+4HEa6C6kGPPM6lKo6
+# lZb0MT/u4kGjdyjEf/4AQBFm4nKR/VLr5xpBdbozO8PCPs3ev4XRj6vvbWBik6XB
+# 9FplKrbJ/1LZE4ieoiDFUugRe2u8oftnww4+ptCQMYIB1zCCAdMCAQEwNjAiMSAw
+# HgYDVQQDDBdNeVBvd2VyU2hlbGxTaWduaW5nQ2VydAIQaPUl6nyNK6NC5uKFMJiy
+# 7DAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZBgkqhkiG
+# 9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYBBAGCNwIB
+# FTAjBgkqhkiG9w0BCQQxFgQUcLA/N58pZsLehyke2swgAyArlgwwDQYJKoZIhvcN
+# AQEBBQAEggEAI1HU93xTyX3D4WpwN1q+wHySoTL/x7EwNyaf0I8NTFM5qc1fzk2N
+# Exq7GenqJLe3GFWZxWYi0E5ApU/EMq20BSnrRtasfQcyxPl78bdtHqHW9z37KqtD
+# 66ruKzDxTbOWR+08QVrwbVCqgHg1NFglwOKVdVJLvM56gmic0QfrdNdLclnt76sy
+# Rai+uBb6a2jOOt1vJxvAhYIBYTZLbIYggouVIave8bMPbCZ832DBR6RwZtT3o6vN
+# qPvzyKR8jLh5BgI/w8ADv3udhYsFOlW2UdqY8ZV813XBdv6XhTCTbJxCaquW24Dy
+# uu+YWYLS6orIaUQmt6G2lq5MrRMpnr4V8w==
+# SIG # End signature block
+
+
+# Install the Windows Update module from the PowerShell Gallery
+Install-Module -Name PSWindowsUpdate -Force
+
+# Import the module into your current session
+Import-Module -Name PSWindowsUpdate
+
+# Check for available updates
+Get-WindowsUpdate
+
+
+#Install all available updates and automatically reboot if needed
+
+Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -AutoReboot
