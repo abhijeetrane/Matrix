@@ -1,4 +1,4 @@
-package matrix;
+package matrix.base;
 
 import vista.ui.VistaUI;
 
@@ -108,6 +108,7 @@ public class Earth{
      
      VistaUI vistaUI = new VistaUI(SPACEPLACE);
      
+     vistaUI.setVisible(true);
      
 	}
 	

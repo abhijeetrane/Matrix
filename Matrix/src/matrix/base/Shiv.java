@@ -1,4 +1,4 @@
-package matrix;
+package matrix.base;
 
 // File: InnerShiva.java
 

@@ -1,4 +1,4 @@
-package matrix;
+package matrix.base;
 
 import javax.swing.*;
 import java.awt.*;

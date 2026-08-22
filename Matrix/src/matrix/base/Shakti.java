@@ -1,4 +1,4 @@
-package matrix;
+package matrix.base;
 
 
 //Base public class

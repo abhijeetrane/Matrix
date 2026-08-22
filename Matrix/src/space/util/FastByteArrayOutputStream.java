@@ -59,9 +59,3 @@ public class FastByteArrayOutputStream extends OutputStream {
     return new FastByteArrayInputStream(this.buf, this.size);
   }
 }
-
-
-/* Location:              E:\masters_projects\Tahiti\src\space.jar!\spac\\util\FastByteArrayOutputStream.class
- * Java compiler version: 5 (49.0)
- * JD-Core Version:       1.1.3
- */

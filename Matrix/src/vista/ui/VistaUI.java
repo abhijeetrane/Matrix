@@ -137,7 +137,9 @@ public class VistaUI extends JFrame implements NucleusListener{
 
     setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 
-    setSize(400,525);
+  //  setSize(400,525);
+    
+    setSize(1350,720);
     
     System.out.println("DEBUG"+DEBUG);
     

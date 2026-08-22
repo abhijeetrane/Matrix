@@ -41,9 +41,3 @@ public class FastByteArrayInputStream extends InputStream {
     return paramLong;
   }
 }
-
-
-/* Location:              E:\masters_projects\Tahiti\src\space.jar!\spac\\util\FastByteArrayInputStream.class
- * Java compiler version: 5 (49.0)
- * JD-Core Version:       1.1.3
- */

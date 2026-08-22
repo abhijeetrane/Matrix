@@ -28,9 +28,3 @@ public class _Assert {
       fail(); 
   }
 }
-
-
-/* Location:              E:\masters_projects\Tahiti\src\space.jar!\spac\\util\_Assert.class
- * Java compiler version: 5 (49.0)
- * JD-Core Version:       1.1.3
- */

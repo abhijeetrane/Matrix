@@ -25,9 +25,3 @@ public class UnoptimizedDeepCopy {
     return object;
   }
 }
-
-
-/* Location:              E:\masters_projects\Tahiti\src\space.jar!\spac\\util\UnoptimizedDeepCopy.class
- * Java compiler version: 5 (49.0)
- * JD-Core Version:       1.1.3
- */

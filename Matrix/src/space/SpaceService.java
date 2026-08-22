@@ -18,9 +18,3 @@ public interface SpaceService {
   
   void notify(Entry paramEntry, Transaction paramTransaction, RemoteEventListener paramRemoteEventListener, long paramLong, MarshalledObject paramMarshalledObject) throws Exception;
 }
-
-
-/* Location:              E:\masters_projects\Tahiti\src\space.jar!\space\SpaceService.class
- * Java compiler version: 5 (49.0)
- * JD-Core Version:       1.1.3
- */
