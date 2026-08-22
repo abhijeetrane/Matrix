@@ -10,6 +10,8 @@ package vista.object;
 @author Tahiti.
 */
 
+//Spid represents Shiva in Ardhanareshwar avatar
+
 public class SpidData {
   private Long spid;
   private Integer clid;

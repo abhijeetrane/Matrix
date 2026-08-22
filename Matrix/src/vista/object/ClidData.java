@@ -8,6 +8,9 @@ package vista.object;
 
 @author Tahiti.
 */
+
+//clid represents Shakti
+
 public class ClidData {
 /** Clid */
   private Integer clid;

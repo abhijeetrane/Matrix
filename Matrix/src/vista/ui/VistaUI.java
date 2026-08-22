@@ -102,7 +102,7 @@ public class VistaUI extends JFrame implements NucleusListener{
       @param url Space URL.
   */
   public VistaUI(String url) {
-    super("Vista - Version 1.0");
+    super("Vista - Version 1.0 - Spid = Shiva and Clid=Shakti");
   try{
 	  System.out.println("Constructor VistaUI Begin ");
       vistaSpace = new VistaSpace(url,REGISTRY_PORT);

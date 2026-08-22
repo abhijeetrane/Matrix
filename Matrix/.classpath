@@ -6,12 +6,5 @@
 		</attributes>
 	</classpathentry>
 	<classpathentry kind="src" path="src"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/TowrOfHanoi"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/ArtificialIntelligence"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/Mini-Java-Compiler"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/EastMatrixByAbhijeetRane"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/GraphColoringProblem"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/NQueenProblem"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/WestMatrixByAmyRyan"/>
 	<classpathentry kind="output" path="bin"/>
 </classpath>

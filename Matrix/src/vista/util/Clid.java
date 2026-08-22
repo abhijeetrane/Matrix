@@ -14,6 +14,8 @@ import space.Entry;
 
     @author Team Suva
 */
+//Clid represents Shakti
+
 public class Clid {
   /** the entry, from which the class name can be determined. */
   private space.Entry entry;
